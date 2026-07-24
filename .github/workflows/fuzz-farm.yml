@@ -67,6 +67,14 @@ jobs:
           cp scripts/openssl/build-static-openssl-linux.sh "$workdir/"
           ( cd "$workdir" && CC=clang-20 CXX=clang++-20 sh build-static-openssl-linux.sh )
 
+      - name: Restaurar corpus (persiste lo APRENDIDO entre runs)
+        uses: actions/cache@v4
+        with:
+          path: fuzz/${{ matrix.corpus }}
+          key: cbmpc-corpus-${{ matrix.harness }}-${{ github.run_id }}
+          restore-keys: |
+            cbmpc-corpus-${{ matrix.harness }}-
+
       - name: Compilar fuzzer + FUZZ
         id: fuzz
         env:
