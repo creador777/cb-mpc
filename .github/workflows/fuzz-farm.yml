@@ -36,7 +36,7 @@ jobs:
           - { bin: fuzz_malicious_mp, build: build_fuzz_malicious.sh, corpus: corpus_mp }
           - { bin: fuzz_schnorr,      build: build_fuzz_schnorr.sh,   corpus: corpus_schnorr }
           - { bin: fuzz_tdh2,         build: build_fuzz_tdh2.sh,      corpus: corpus_tdh2 }   # NUEVO target: threshold decryption
-        shard: [1, 2, 3]   # 4 harnesses x 3 shards = 12 jobs; deja aire para check/codeql
+        shard: [1, 2, 3, 4]   # 4 harnesses x 4 shards = 16 jobs (~64 nucleos); tope estable, deja aire para check/codeql sin encolar
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
