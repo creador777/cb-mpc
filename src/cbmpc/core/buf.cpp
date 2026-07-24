@@ -1,0 +1,765 @@
+#include <cstring>
+
+#include <cbmpc/core/buf.h>
+#include <cbmpc/internal/core/convert.h>
+#include <cbmpc/internal/core/strext.h>
+
+namespace coinbase {
+
+buf_t::buf_t() noexcept(true) : s(0) { static_assert(sizeof(buf_t) == 40, "Invalid buf_t size."); }
+
+buf_t::buf_t(int new_size) : s(new_size) {  // NOLINT(*init*)
+  // NOTE: `buf_t(int)` intentionally leaves the buffer contents uninitialized.
+  // Callers must fully overwrite `size()` bytes before reading from `data()`.
+  cb_assert(new_size >= 0);
+  if (new_size > short_size) set_long_ptr(new byte_t[new_size]);
+}
+
+buf_t::buf_t(const_byte_ptr src, int src_size) {  // NOLINT(*init*)
+  if (src_size <= short_size)
+    assign_short(src, src_size);
+  else
+    assign_long(src, src_size);
+}
+
+buf_t::buf_t(mem_t mem) {  // NOLINT(*init*)
+  if (mem.size <= short_size)
+    assign_short(mem.data, mem.size);
+  else
+    assign_long(mem.data, mem.size);
+}
+
+buf_t::operator buf128_t() const {
+  cb_assert(s == sizeof(buf128_t));
+  return buf128_t::load(m);
+}
+
+buf_t& buf_t::operator=(buf128_t src) {
+  if (s > short_size) {
+    byte_ptr old_long_ptr = get_long_ptr();
+    coinbase::secure_bzero(old_long_ptr, s);
+    delete[] old_long_ptr;
+  }
+
+  s = sizeof(buf128_t);
+  src.save(m);
+  return *this;
+}
+
+buf_t::buf_t(buf128_t src) : s(sizeof(buf128_t)) {  // NOLINT(*init*)
+  src.save(m);
+}
+
+buf_t::operator buf256_t() const {
+  cb_assert(s == sizeof(buf256_t));
+  return buf256_t::load(m);
+}
+
+buf_t& buf_t::operator=(buf256_t src) {
+  if (s > short_size) {
+    byte_ptr old_long_ptr = get_long_ptr();
+    coinbase::secure_bzero(old_long_ptr, s);
+    delete[] old_long_ptr;
+  }
+
+  s = sizeof(buf256_t);
+  src.save(m);
+  return *this;
+}
+
+buf_t::buf_t(buf256_t src) : s(sizeof(buf256_t)) {  // NOLINT(*init*)
+  src.save(m);
+}
+
+void buf_t::free() {
+  int size = s;
+  byte_ptr ptr = data();
+  coinbase::secure_bzero(ptr, s);
+  if (size > short_size) delete[] ptr;
+  s = 0;
+}
+
+buf_t::~buf_t() { free(); }
+
+byte_ptr buf_t::data() const { return (s <= short_size) ? byte_ptr(m) : get_long_ptr(); }
+
+byte_ptr buf_t::ptr() const { return s ? data() : nullptr; }
+
+int buf_t::size() const { return s; }
+
+bool buf_t::empty() const { return s == 0; }
+
+buf_t& buf_t::operator=(mem_t src) {
+  if (s == src.size && data() == src.data) return *this;
+
+  // `mem_t` is a view and may alias this buffer (for example `buf = buf.take(n)`),
+  // so copy it before zeroizing or reallocating the current storage.
+  buf_t tmp(src);
+  *this = std::move(tmp);
+  return *this;
+}
+
+buf_t::buf_t(const buf_t& src) {
+  if (src.s <= short_size)
+    assign_short(src);
+  else
+    assign_long(src.data(), src.s);
+}
+
+buf_t::buf_t(buf_t&& src) {
+  if (src.s <= short_size)
+    assign_short(src);
+  else {
+    assign_long_ptr(src.get_long_ptr(), src.s);
+    src.s = 0;
+  }
+}
+
+buf_t& buf_t::operator=(const buf_t& src) {
+  if (this != &src) {
+    free();
+
+    if (src.s <= short_size)
+      assign_short(src);
+    else
+      assign_long(src.data(), src.s);
+  }
+
+  return *this;
+}
+
+buf_t& buf_t::operator=(buf_t&& src) {
+  if (&src != this) {
+    free();
+
+    if (src.s <= short_size)
+      assign_short(src);
+    else {
+      assign_long_ptr(src.get_long_ptr(), src.s);
+      src.s = 0;
+    }
+  }
+  return *this;
+}
+
+byte_ptr buf_t::resize_save_short_to_short(int new_size) {
+  if (new_size < s) coinbase::secure_bzero(m + new_size, s - new_size);
+  s = new_size;
+  return m;
+}
+
+byte_ptr buf_t::resize_save_short_to_long(int new_size) {
+  byte_ptr new_ptr = new byte_t[new_size];
+  memmove(new_ptr, m, s);
+  coinbase::secure_bzero(m, s);
+  assign_long_ptr(new_ptr, new_size);
+  return new_ptr;
+}
+
+byte_ptr buf_t::resize_save_long_to_short(int new_size) {
+  byte_ptr old_ptr = get_long_ptr();
+  memmove(m, old_ptr, new_size);
+  coinbase::secure_bzero(old_ptr, s);
+  delete[] old_ptr;
+  s = new_size;
+  return m;
+}
+
+byte_ptr buf_t::resize_save_long_to_long(int new_size) {
+  byte_ptr old_ptr = get_long_ptr();
+  byte_ptr new_ptr = new byte_t[new_size];
+
+  int copy_size = s < new_size ? s : new_size;
+  memmove(new_ptr, old_ptr, copy_size);
+
+  coinbase::secure_bzero(old_ptr, s);
+  delete[] old_ptr;
+
+  assign_long_ptr(new_ptr, new_size);
+  return new_ptr;
+}
+
+byte_ptr buf_t::resize(int new_size) {
+  if (s == new_size) return data();
+
+  if (s <= short_size) {
+    if (new_size <= short_size) return resize_save_short_to_short(new_size);
+    return resize_save_short_to_long(new_size);
+  }
+
+  if (new_size <= short_size) return resize_save_long_to_short(new_size);
+  return resize_save_long_to_long(new_size);
+}
+
+byte_ptr buf_t::alloc(int new_size) {
+  if (s == new_size) return data();
+
+  free();
+  s = new_size;
+  if (new_size <= short_size) return m;
+  byte_ptr new_ptr = new byte_t[new_size];
+  set_long_ptr(new_ptr);
+  return new_ptr;
+}
+
+void buf_t::bzero() { coinbase::bzero(data(), s); }
+
+void buf_t::secure_bzero() { coinbase::secure_bzero(data(), s); }
+
+bool buf_t::operator==(const buf_t& src) const {
+  if (s != src.s) return false;
+  byte_t x = 0;
+  byte_ptr p1 = data();
+  byte_ptr p2 = src.data();
+  for (int i = 0; i < s; i++) x |= p1[i] ^ p2[i];
+  return x == 0;
+}
+
+bool buf_t::operator!=(const buf_t& src) const { return !(*this == src); }
+
+buf_t::operator mem_t() const { return mem_t(data(), s); }
+
+uint8_t buf_t::operator[](int index) const {
+  cb_assert(index >= 0 && index < s);
+  return data()[index];
+}
+
+uint8_t& buf_t::operator[](int index) {
+  cb_assert(index >= 0 && index < s);
+  return data()[index];
+}
+
+buf_t operator^(mem_t src1, mem_t src2) {
+  cb_assert(src1.size == src2.size);
+  buf_t out(src1.size);
+
+  byte_ptr dst = out.data();
+  for (int i = 0; i < src2.size; i++) dst[i] = src1.data[i] ^ src2.data[i];
+
+  return out;
+}
+
+buf_t& buf_t::operator^=(mem_t src2) {
+  cb_assert(src2.size == s);
+
+  byte_ptr dst = data();
+  for (int i = 0; i < src2.size; i++) dst[i] ^= src2.data[i];
+  return *this;
+}
+
+buf_t operator+(mem_t src1, mem_t src2) {
+  cb_assert(src1.size >= 0 && src2.size >= 0);
+  cb_assert(src1.size <= INT_MAX - src2.size);  // overflow check
+  buf_t out(src1.size + src2.size);
+  memmove(out.data(), src1.data, src1.size);
+  memmove(out.data() + src1.size, src2.data, src2.size);
+  return out;
+}
+
+buf_t& buf_t::operator+=(mem_t src) {
+  cb_assert(src.size >= 0);
+  cb_assert(s <= INT_MAX - src.size);  // overflow check
+  // `mem_t` may point into this buffer, and resize() can zeroize/reallocate it.
+  buf_t tmp(src);
+  int old_size = s;
+  byte_ptr new_ptr = resize(old_size + tmp.size());
+  memmove(new_ptr + old_size, tmp.data(), tmp.size());
+  return *this;
+}
+
+void buf_t::reverse() { mem_t(*this).reverse(); }
+
+std::string buf_t::to_string() const { return std::string(const_char_ptr(data()), s); }
+
+byte_ptr buf_t::get_long_ptr() const {
+  byte_ptr ptr;
+  std::memcpy(&ptr, m, sizeof(ptr));
+  return ptr;
+}
+
+void buf_t::set_long_ptr(byte_ptr ptr) { std::memcpy(m, &ptr, sizeof(ptr)); }
+
+void buf_t::assign_short(const_byte_ptr src, int src_size) {
+  for (int i = 0; i < src_size; i++) m[i] = src[i];
+  s = src_size;
+}
+
+void buf_t::assign_short(const buf_t& src) {
+  // Copy the entire short inline storage and the size. Keep this UB-free: `m` is byte-aligned,
+  // so type-punning via `(uint64_t*)` / `(byte_ptr*)` can violate strict-aliasing and alignment.
+  std::memcpy(m, src.m, short_size);
+  s = src.s;
+}
+
+void buf_t::assign_long_ptr(byte_ptr ptr, int size) {
+  set_long_ptr(ptr);
+  s = size;
+}
+
+void buf_t::assign_long(const_byte_ptr ptr, int size) {
+  byte_ptr new_ptr = new byte_t[size];
+  memmove(new_ptr, ptr, size);
+  assign_long_ptr(new_ptr, size);
+}
+
+void buf_t::convert(converter_t& converter) {
+  uint32_t value_size = size();
+  converter.convert_len(value_size);
+
+  if (converter.is_write()) {
+    if (!converter.is_calc_size()) memmove(converter.current(), data(), value_size);
+  } else {
+    if (int(value_size) < 0) {
+      converter.set_error();
+      return;
+    }  // deserialization length validation
+
+    if (converter.is_error() || !converter.at_least(value_size)) {
+      converter.set_error();
+      return;
+    }
+    memmove(alloc(value_size), converter.current(), value_size);
+  }
+  converter.forward(value_size);
+}
+
+int buf_t::get_convert_size(int data_size) {  // static
+  coinbase::converter_t converter(true);
+  uint32_t s = data_size;
+  converter.convert_len(s);
+  return converter.get_size() + data_size;
+}
+
+void buf_t::convert_fixed_size(coinbase::converter_t& converter, int fixed_size) {
+  if (converter.is_write()) {
+    if (!converter.is_calc_size()) {
+      cb_assert(size() == fixed_size);
+      memmove(converter.current(), data(), fixed_size);
+    }
+  } else {
+    if (converter.is_error() || !converter.at_least(fixed_size)) {
+      converter.set_error();
+      return;
+    }
+    memmove(alloc(fixed_size), converter.current(), fixed_size);
+  }
+  converter.forward(fixed_size);
+}
+
+void buf_t::convert_last(converter_t& converter) {
+  if (converter.is_write()) {
+    if (!converter.is_calc_size()) memmove(converter.current(), data(), size());
+  } else {
+    if (converter.is_error()) return;
+    const int s = converter.get_size() - converter.get_offset();
+    if (s < 0 || !converter.at_least(s)) {
+      converter.set_error();
+      return;
+    }
+    memmove(alloc(s), converter.current(), s);
+  }
+  converter.forward(size());
+}
+
+void memmove_reverse(byte_ptr dst, const_byte_ptr src, int size) {
+  dst += size;
+  while (size--) *--dst = *src++;
+}
+
+void mem_t::reverse() {
+  int l = 0;
+  int r = size - 1;
+  byte_ptr p = const_cast<byte_ptr>(data);
+  while (l < r) {
+    uint8_t t = p[l];
+    p[l] = p[r];
+    p[r] = t;
+    l++;
+    r--;
+  }
+}
+
+buf_t mem_t::rev() const {
+  buf_t out(size);
+  memmove_reverse(out.data(), data, size);
+  return out;
+}
+
+bool mem_t::equal(mem_t m1, mem_t m2) {
+  if (m1.size != m2.size) return false;
+  byte_t x = 0;
+  for (int i = 0; i < m1.size; i++) x |= m1.data[i] ^ m2.data[i];
+  return x == 0;
+}
+
+bool mem_t::operator==(const mem_t& m2) const { return mem_t::equal(*this, m2); }
+bool mem_t::operator!=(const mem_t& m2) const { return !mem_t::equal(*this, m2); }
+bool mem_t::operator==(const buf_t& m2) const { return mem_t::equal(*this, mem_t(m2)); }
+bool mem_t::operator!=(const buf_t& m2) const { return !mem_t::equal(*this, mem_t(m2)); }
+
+size_t mem_t::non_crypto_hash() const {
+  const_byte_ptr p = data;
+  int n = size;
+  uint32_t x = 1;
+
+  while (n >= 4) {
+    uint32_t chunk;
+    std::memcpy(&chunk, p, sizeof(chunk));
+    x ^= chunk;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    n -= 4;
+    p += 4;
+  }
+
+  while (n > 0) {
+    x ^= *p;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    n--;
+    p++;
+  }
+
+  return x;
+}
+
+std::string mem_t::to_string() const {
+  if (size <= 0 || !data) return "";
+  return std::string(const_char_ptr(data), static_cast<size_t>(size));
+}
+
+// ------------------------- bits_t ---------------------
+
+bool bits_t::get(const_byte_ptr data, int index) {
+  int offset = index >> 3;
+  int n = index & 7;
+  return ((data[offset] >> n) & 1) != 0;
+}
+
+void bits_t::set(byte_ptr data, int index, bool bit) {
+  if (bit)
+    set_true(data, index);
+  else
+    set_false(data, index);
+}
+
+void bits_t::set_true(byte_ptr data, int index) {
+  int offset = index >> 3;
+  int n = index & 7;
+  uint8_t mask = 1 << n;
+  data[offset] |= mask;
+}
+
+void bits_t::set_false(byte_ptr data, int index) {
+  int offset = index >> 3;
+  int n = index & 7;
+  uint8_t mask = 1 << n;
+  data[offset] &= ~mask;
+}
+
+bits_t::bits_t() : data(nullptr), bits(0) {}
+
+bits_t::bits_t(bits_t&& src) {  // move constructor
+  data = src.data;
+  bits = src.bits;
+  src.data = nullptr;
+  src.bits = 0;
+}
+
+bits_t& bits_t::operator=(bits_t&& src) {  // move assignment
+  if (&src != this) {
+    free();
+    data = src.data;
+    bits = src.bits;
+    src.data = nullptr;
+    src.bits = 0;
+  }
+  return *this;
+}
+
+void bits_t::free() {
+  if (bits) {
+    int n = bits_to_limbs(bits);
+    secure_bzero((byte_ptr)data, n * int(sizeof(limb_t)));
+    delete[] data;
+  }
+  data = nullptr;
+  bits = 0;
+}
+
+void bits_t::copy_from(const bits_t& src) {
+  if (&src == this) return;
+
+  if (src.bits == 0) {
+    free();
+    return;
+  }
+
+  alloc(src.bits);
+
+  int n = bits_to_limbs(bits);
+  cb_assert(n > 0);
+  cb_assert(data && src.data);
+  memmove(data, src.data, n * sizeof(limb_t));
+}
+
+bits_t::bits_t(const bits_t& src) : data(nullptr), bits(0) {  // copy constructor
+  copy_from(src);
+}
+
+bits_t::bits_t(int count) : data(nullptr), bits(0) {
+  if (!count) return;
+  bits = count;
+  int n = bits_to_limbs(bits);
+  data = new limb_t[n];
+  memset(data, 0, n * sizeof(limb_t));
+}
+
+bits_t& bits_t::operator=(const bits_t& src) {  // copy assignment
+  if (&src != this) copy_from(src);
+  return *this;
+}
+
+void bits_t::bzero() { coinbase::bzero(byte_ptr(data), bits_to_limbs(bits) * int(sizeof(limb_t))); }
+
+void bits_t::convert(converter_t& converter) {
+  uint32_t count = bits;
+  converter.convert_len(count);
+
+  int size = coinbase::bits_to_bytes(count);
+
+  if (converter.is_write()) {
+    if (size && !converter.is_calc_size()) {
+      bzero_unused();
+      memmove(converter.current(), data, size);
+    }
+  } else {
+    if (!converter.at_least(size)) {
+      converter.set_error();
+      return;
+    }
+    alloc(count);
+    if (size) memmove(data, converter.current(), size);
+  }
+  converter.forward(size);
+}
+
+void bits_t::bzero_unused() const {
+  int n = bits_to_limbs(bits);
+  int unused_bits = n * bits_in_limb - bits;
+  if (unused_bits > 0) data[n - 1] &= (limb_t(-1) >> unused_bits);
+}
+
+mem_t bits_t::to_bin() const {
+  bzero_unused();
+  return mem_t(const_byte_ptr(data), bits_to_bytes(bits));
+}
+
+bits_t bits_t::from_bin(mem_t src) {
+  bits_t dst(bytes_to_bits(src.size));
+  if (src.size) memmove(dst.data, src.data, src.size);  // NOLINT
+  return dst;
+}
+
+void bits_t::resize(int count) {
+  cb_assert(count >= 0 && "bits_t::resize: count must be non-negative");
+  if (count == bits) return;
+
+  // If we're growing, ensure the currently-unused tail bits are cleared before they become "visible".
+  if (count > bits && bits > 0) bzero_unused();
+
+  int n_old = bits_to_limbs(bits);
+  int n_new = bits_to_limbs(count);
+  if (n_old == n_new) {
+    bits = count;
+    if (bits > 0) bzero_unused();
+    return;
+  }
+
+  if (count == 0) {
+    free();
+    return;
+  }
+
+  limb_t* old_data = data;
+  bits = count;
+
+  data = new limb_t[n_new];
+  memset(data, 0, n_new * sizeof(limb_t));
+
+  int n_copy = std::min(n_old, n_new);
+  if (n_copy) memmove(data, old_data, n_copy * sizeof(limb_t));
+  bzero_unused();
+
+  if (n_old) {
+    secure_bzero((byte_ptr)old_data, n_old * int(sizeof(limb_t)));
+    delete[] old_data;
+  }
+}
+
+void bits_t::alloc(int count) {
+  int n_old = bits_to_limbs(bits);
+  int n_new = bits_to_limbs(count);
+  if (n_old == n_new) {
+    bits = count;
+    return;
+  }
+
+  free();
+  if (count > 0) {
+    bits = count;
+    data = new limb_t[n_new];
+  }
+}
+
+bits_t::ref_t::ref_t(limb_t* ptr, int index) : data(ptr + index / bits_in_limb), offset(index & (bits_in_limb - 1)) {}
+
+bool bits_t::get(int index) const {
+  cb_assert(index >= 0 && index < bits);
+  return ref_t(data, index).get();
+}
+
+void bits_t::set(int index, bool value) {
+  cb_assert(index >= 0 && index < bits);
+  ref_t(data, index).set(value);
+}
+
+void bits_t::append(bool value) {
+  cb_assert(bits >= 0 && "bits_t::append: invalid bit count");
+  cb_assert(bits < INT_MAX && "bits_t::append: bit count overflow");
+  resize(bits + 1);
+  set(bits - 1, value);
+}
+
+void bits_t::ref_t::set(bool value) {
+  limb_t mask_value = limb_t(value ? 1 : 0) << offset;
+  limb_t mask = limb_t(1) << offset;
+  *data = (*data & ~mask) | mask_value;
+}
+
+bool bits_t::ref_t::get() const { return 0 != ((*data >> offset) & 1); }
+
+bits_t::ref_t bits_t::operator[](int index) {
+  cb_assert(index >= 0 && index < bits);
+  return ref_t(data, index);
+}
+
+bits_t& bits_t::operator^=(const bits_t& src) {
+  cb_assert(src.bits == bits);
+  int n = bits_to_limbs(bits);
+  for (int i = 0; i < n; i++) data[i] ^= src.data[i];
+  return *this;
+}
+
+bits_t operator^(const bits_t& src1, const bits_t& src2) {
+  cb_assert(src1.bits == src2.bits);
+
+  bits_t out;
+  out.alloc(src1.bits);
+
+  int n = bits_t::bits_to_limbs(src1.bits);
+  for (int i = 0; i < n; i++) out.data[i] = src1.data[i] ^ src2.data[i];  // NOLINT
+
+  return out;
+}
+
+bits_t& bits_t::operator+=(const bits_t& src2) {
+  int n1 = count();
+  int n2 = src2.count();
+  cb_assert(n1 >= 0 && n2 >= 0);
+  cb_assert(n2 <= INT_MAX - n1 && "bits_t::operator+=: size overflow");
+  const int new_count = n1 + n2;
+
+  // Special-case self-append: `to_bin()` returns a view into `data`, and `resize()` may reallocate + free the old
+  // buffer, turning that view into a dangling pointer. This can trigger UAF for `x += x` on the byte-aligned fast path.
+  if (&src2 == this) {
+    resize(new_count);
+    if ((n1 % 8) == 0) {
+      const int bytes = bits_to_bytes(n1);
+      // Append the original bytes by copying within the resized buffer.
+      memmove(byte_ptr(data) + bytes, data, bytes);
+    } else {
+      // Bit-level append (no overlap: read from [0..n1), write to [n1..n1+n2)).
+      for (int i = 0; i < n2; i++) (*this)[n1 + i] = (*this)[i];
+    }
+    return *this;
+  }
+
+  mem_t src1_mem = to_bin();
+  mem_t src2_mem = src2.to_bin();
+
+  resize(new_count);
+  if ((n1 % 8) == 0) {
+    memmove(byte_ptr(data) + src1_mem.size, src2_mem.data, src2_mem.size);
+  } else {
+    for (int i = 0; i < n2; i++) (*this)[n1 + i] = src2[i];
+  }
+  return *this;
+}
+
+bits_t bits_t::operator+(const bits_t& src2) const {
+  int n1 = count();
+  int n2 = src2.count();
+  cb_assert(n1 >= 0 && n2 >= 0);
+  cb_assert(n2 <= INT_MAX - n1 && "bits_t::operator+: size overflow");
+  const int new_count = n1 + n2;
+  bits_t dst(new_count);
+
+  mem_t dst_mem = dst.to_bin();
+  mem_t src1_mem = to_bin();
+  mem_t src2_mem = src2.to_bin();
+
+  memmove(dst.data, src1_mem.data, src1_mem.size);
+  if ((n1 % 8) == 0)
+    memmove(byte_ptr(dst.data) + src1_mem.size, src2_mem.data, src2_mem.size);
+  else {
+    for (int i = 0; i < n2; i++) dst[n1 + i] = src2[i];
+  }
+  return dst;
+}
+
+std::vector<mem_t> buf_t::to_mems(const std::vector<buf_t>& in) {
+  size_t count = in.size();
+  cb_assert(count <= INT_MAX);
+  std::vector<mem_t> out(count);
+  for (size_t i = 0; i < count; i++) out[i] = in[i];
+  return out;
+}
+
+std::vector<mem_t> buf_t::to_mems(const std::vector<std::string>& in) {
+  size_t count = in.size();
+  cb_assert(count <= INT_MAX);
+  std::vector<mem_t> out(count);
+  for (size_t i = 0; i < count; i++) out[i] = mem_t::from_string(in[i]);
+  return out;
+}
+
+std::vector<buf_t> buf_t::from_mems(const std::vector<mem_t>& in) {
+  size_t count = in.size();
+  cb_assert(count <= INT_MAX);
+  std::vector<buf_t> out(count);
+  for (size_t i = 0; i < count; i++) out[i] = in[i];
+  return out;
+}
+
+}  // namespace coinbase
+
+namespace coinbase {
+
+std::ostream& operator<<(std::ostream& os, mem_t mem) {
+  // NOTE: `mem_t` is frequently used to carry opaque blobs, including secrets (key shares, plaintexts, etc.).
+  // Dumping full hex in production is a common source of accidental secret leakage via logs.
+  //
+  // In Debug builds, keep the full hex dump for developer ergonomics.
+  // In non-Debug builds, redact content and print only the size.
+#ifdef _DEBUG
+  os << strext::to_hex(mem);
+#else
+  os << "<mem_t size=" << mem.size << ">";
+#endif
+  return os;
+}
+
+}  // namespace coinbase

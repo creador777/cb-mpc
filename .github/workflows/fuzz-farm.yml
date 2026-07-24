@@ -1,0 +1,144 @@
+name: fuzz-farm-cbmpc
+
+# ============================================================================
+#  GRANJA 24/7 — cb-mpc (Coinbase) para bug bounty HackerOne.
+#  Caza panics/breaks en los protocolos MPC via API publica (modelo del bounty).
+#   - concurrency cancel-in-progress -> nunca se apila ni se atasca.
+#   - clasificacion: el DoS is_in_range (ya conocido, Low) NO alerta;
+#     forgery/nonce-reuse/key-leak/memoria (ALTO VALOR $15K-$50K) -> email.
+#   - crash cifrado con GPG si existe el secret GPG_PUBLIC_KEY (disclosure
+#     responsable: sin GPG no se sube el crash crudo a un repo publico).
+#  Build replicado del Dockerfile del repo: clang-20 + OpenSSL 3.6.1 estatico.
+# ============================================================================
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: fuzz-farm-cbmpc
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { harness: fuzz_malicious,    build: build_fuzz_malicious.sh, corpus: corpus }
+          - { harness: fuzz_malicious_mp, build: build_fuzz_malicious.sh, corpus: corpus_mp }
+          - { harness: fuzz_schnorr,      build: build_fuzz_schnorr.sh,   corpus: corpus_schnorr }
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
+      FUZZTIME: '16800'   # 4h40m; deja margen para el build bajo el timeout de 355min
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar LLVM 20 + deps (igual que el Dockerfile)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev cmake rsync wget gnupg ca-certificates lsb-release
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-20 lld-20 llvm-20 libfuzzer-20-dev libclang-rt-20-dev
+
+      - name: Cache OpenSSL 3.6.1 estatico
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/opt/openssl@3.6.1
+          key: openssl-3.6.1-${{ runner.os }}-clang20-v1
+
+      - name: Build OpenSSL 3.6.1 (si no esta cacheado)
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /usr/local/opt
+          sudo chown -R "$USER" /usr/local/opt
+          workdir="$(mktemp -d)"
+          cp scripts/openssl/build-static-openssl-linux.sh "$workdir/"
+          ( cd "$workdir" && CC=clang-20 CXX=clang++-20 sh build-static-openssl-linux.sh )
+
+      - name: Compilar fuzzer + FUZZ
+        id: fuzz
+        env:
+          CC: clang-20
+          CXX: clang++-20
+          CBMPC_OPENSSL_ROOT: /usr/local/opt/openssl@3.6.1
+        run: |
+          set +e
+          bash "fuzz/${{ matrix.build }}"
+          brc=$?
+          if [ "$brc" != "0" ]; then echo "BUILD FAILED rc=$brc"; echo "rc=200" >> "$GITHUB_OUTPUT"; exit 0; fi
+          cd fuzz
+          mkdir -p "${{ matrix.corpus }}"
+          ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:symbolize=1:handle_abort=1:handle_segv=1 \
+          UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            ./"${{ matrix.harness }}" -fork=2 -ignore_crashes=1 -rss_limit_mb=4096 -timeout=25 \
+            -max_total_time="${FUZZTIME}" -artifact_prefix=hit_ "${{ matrix.corpus }}" > fuzz.log 2>&1
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          echo "----- tail fuzz.log -----"; tail -n 25 fuzz.log || true
+
+      - name: Clasificar (ALTO VALOR vs DoS is_in_range)
+        id: classify
+        if: steps.fuzz.outputs.rc != '200'
+        run: |
+          cd fuzz
+          NEW=0
+          if grep -aE 'CRITICAL \[(NONCE-REUSE|R-INFINITY|KEY-LEAK|SCHNORR-FORGERY|SIGN-BREAK|MP-SIGN-BREAK|REFRESH-BREAK|MP-REFRESH-BREAK)\]' fuzz.log >/dev/null 2>&1; then NEW=1; fi
+          if grep -aE 'SUMMARY: (AddressSanitizer|UndefinedBehaviorSanitizer|MemorySanitizer): (heap-buffer-overflow|heap-use-after-free|use-after-free|stack-buffer-overflow|global-buffer-overflow|double-free|stack-overflow|SEGV|out-of-bounds)' fuzz.log 2>/dev/null | grep -av 'is_in_range' >/dev/null 2>&1; then NEW=1; fi
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          if [ "$NEW" = "1" ]; then echo "::warning::HIT ALTO VALOR en ${{ matrix.harness }} — revisar."; else echo "sin hits de alto valor (solo DoS/ruido)"; fi
+
+      - name: Cifrar hit (solo si hay secret GPG)
+        if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY != ''
+        run: |
+          cd fuzz
+          echo "$GPG_PUBLIC_KEY" > pub.asc
+          gpg --import pub.asc
+          KEYID=$(gpg --list-keys --with-colons | awk -F: '/^pub/{print $5; exit}')
+          tar czf hit.tgz fuzz.log hit_* 2>/dev/null || tar czf hit.tgz fuzz.log
+          gpg --trust-model always --yes -e -r "$KEYID" hit.tgz
+          rm -f hit.tgz fuzz.log hit_* pub.asc
+
+      - name: Subir hit CIFRADO
+        if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: HIT-${{ matrix.harness }}
+          path: fuzz/hit.tgz.gpg
+          retention-days: 30
+
+      - name: Subir SOLO firma (sin GPG: no filtrar crash a repo publico)
+        if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY == ''
+        run: |
+          cd fuzz
+          { echo "HIT ALTO VALOR en ${{ matrix.harness }}"; grep -aE 'CRITICAL \[|SUMMARY:' fuzz.log | grep -av 'is_in_range' | head -20; echo "(sin GPG: crash crudo NO subido. Setea el secret GPG_PUBLIC_KEY para captura cifrada.)"; } > hit_signature.txt
+
+      - name: Subir firma
+        if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: HIT-SIGNATURE-${{ matrix.harness }}
+          path: fuzz/hit_signature.txt
+          retention-days: 30
+
+      - name: Marcar fallo si HIT (dispara email a tu Gmail)
+        if: steps.classify.outputs.new == '1'
+        run: |
+          echo "HIT ALTO VALOR en ${{ matrix.harness }} — revisar artifact."
+          exit 1
+
+      - name: Avisar si el build fallo
+        if: steps.fuzz.outputs.rc == '200'
+        run: |
+          echo "El build del fuzzer fallo — revisar logs del step 'Compilar fuzzer + FUZZ'."
+          exit 1

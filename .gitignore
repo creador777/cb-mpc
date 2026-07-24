@@ -1,0 +1,69 @@
+# We generate the .a files here
+lib/
+
+# Object & binary blobs
+a.out
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.dSYM/
+*.sancov
+
+# Coverage artifacts
+*.profraw
+*.profdata
+
+# CMake generated files
+**build/
+cmake_test_discovery_*.json
+
+# ctest files
+**Testing/
+
+# gh-pages files
+docsgen/
+node_modules/
+
+# Internal tool outputs for human review
+internal_tools/doc-generator/pdf-diffs/
+
+# ---- fuzz farm push excludes ----
+build-fuzz/
+fuzz/crash-*
+fuzz/ecdsa_crash-*
+fuzz/ecdsa_slow-unit-*
+fuzz/slow-unit-*
+fuzz/timeout-*
+fuzz/oom-*
+fuzz/leak-*
+fuzz/hv_*
+fuzz/hit_*
+fuzz/*.log
+fuzz/*.bin
+fuzz/fuzz_malicious
+fuzz/fuzz_malicious_mp
+fuzz/fuzz_schnorr
+fuzz/fuzz_elite
+fuzz/poc_refresh_dos
+fuzz/poc_schnorr_sign_dos
+fuzz/sample_triage/
+fuzz/triage_out*/
+fuzz/HALLAZGOS_ALTO_VALOR/
+fuzz/corpus/
+fuzz/corpus_mp/
+fuzz/corpus_schnorr/
+fuzz/corpus_elite/
+fuzz/fuzzer/
+.github/workflows/ci.yml
+.github/workflows/benchmark.yml
+.github/workflows/codeql.yml
+.github/workflows/make-release.yml
+tmp/
+.pytest_cache/
+problems/
+.zencoder/
+*.pdf

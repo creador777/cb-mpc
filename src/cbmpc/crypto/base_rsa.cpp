@@ -1,0 +1,438 @@
+#include <openssl/core_names.h>
+
+#include <cbmpc/internal/core/log.h>
+#include <cbmpc/internal/crypto/base.h>
+#include <cbmpc/internal/crypto/base_pki.h>
+#include <cbmpc/internal/crypto/scope.h>
+
+namespace coinbase::crypto {
+
+// --------------------- tools -------------
+
+enum {
+  part_e = 1 << 0,
+  part_n = 1 << 1,
+  part_d = 1 << 2,
+  part_p = 1 << 3,
+  part_q = 1 << 4,
+  part_dp = 1 << 5,
+  part_dq = 1 << 6,
+  part_qinv = 1 << 7,
+};
+
+namespace {
+
+constexpr int kMaxRsaPublicExponentBits = 256;
+
+error_t validate_rsa_public_components(const BIGNUM* n, const BIGNUM* e) {
+  if (!n || !e) return coinbase::error(E_BADARG, "missing RSA public key component");
+  if (BN_is_negative(n) || BN_is_zero(n) || BN_is_one(n) || !BN_is_odd(n))
+    return coinbase::error(E_CRYPTO, "invalid RSA public modulus");
+  if (BN_is_negative(e) || BN_is_zero(e) || BN_is_one(e) || !BN_is_odd(e))
+    return coinbase::error(E_CRYPTO, "invalid RSA public exponent");
+  if (BN_num_bits(e) > kMaxRsaPublicExponentBits) return coinbase::error(E_CRYPTO, "RSA public exponent is too large");
+  return SUCCESS;
+}
+
+}  // namespace
+
+// ------------------------------ rsa_pub_key_t -------------------------
+
+error_t rsa_pub_key_t::encrypt_raw(mem_t in, buf_t& out) const {
+  int n_size = size();
+  if (n_size != in.size) return coinbase::error(E_CRYPTO);
+
+  scoped_ptr_t<EVP_PKEY_CTX> ctx = EVP_PKEY_CTX_new(ptr, NULL);
+  if (EVP_PKEY_encrypt_init(ctx) <= 0) return openssl_error("RSA encrypt RAW error");
+  if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_NO_PADDING) <= 0) return openssl_error("RSA encrypt RAW error");
+  size_t outlen = n_size;
+  if (EVP_PKEY_encrypt(ctx, out.alloc(n_size), &outlen, in.data, in.size) <= 0)
+    return openssl_error("RSA encrypt RAW error");
+  return SUCCESS;
+}
+
+error_t rsa_pub_key_t::verify_pkcs1(mem_t in, hash_e hash_alg, mem_t signature) const {
+  buf_t buf;
+  int n_size = size();
+  if (n_size != signature.size) return coinbase::error(E_CRYPTO);
+
+  cb_assert(hash_alg != hash_e::none);
+  scoped_ptr_t<EVP_PKEY_CTX> ctx = EVP_PKEY_CTX_new(ptr, NULL);
+  if (EVP_PKEY_verify_init(ctx) <= 0) return openssl_error("RSA verify error");
+  if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) <= 0) return openssl_error("RSA verify error");
+  if (EVP_PKEY_CTX_set_signature_md(ctx, hash_alg_t::get(hash_alg).md) <= 0) return openssl_error("RSA verify error");
+  if (EVP_PKEY_verify(ctx, signature.data, signature.size, in.data, in.size) != 1)
+    return openssl_error("RSA verify error");
+  return SUCCESS;
+}
+
+void rsa_pub_key_t::create() { free(); }
+
+int rsa_pub_key_t::size() const {
+  if (!ptr) return 0;
+  return EVP_PKEY_get_size(ptr);
+}
+
+void rsa_pub_key_t::set(RSA_BASE*& rsa, const BIGNUM* n, const BIGNUM* e) {
+  cb_assert(n && e);
+  OSSL_PARAM_BLD* param_bld = OSSL_PARAM_BLD_new();
+  OSSL_PARAM_BLD_push_BN(param_bld, "n", n);
+  OSSL_PARAM_BLD_push_BN(param_bld, "e", e);
+  OSSL_PARAM* params = OSSL_PARAM_BLD_to_param(param_bld);
+
+  scoped_ptr_t<EVP_PKEY_CTX> ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+  cb_assert(EVP_PKEY_fromdata_init(ctx) > 0);
+  cb_assert(EVP_PKEY_fromdata(ctx, &rsa, EVP_PKEY_PUBLIC_KEY, params) > 0);
+
+  OSSL_PARAM_free(params);
+  OSSL_PARAM_BLD_free(param_bld);
+}
+
+rsa_pub_key_t::data_t rsa_pub_key_t::get(const EVP_PKEY* pkey) {
+  data_t data;
+  data.n = NULL;
+  data.e = NULL;
+
+  if (EVP_PKEY_id(pkey) != EVP_PKEY_RSA) {
+    // Handle error: Not an RSA key
+    return data;
+  }
+
+  if (EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_N, &data.n) <= 0) {
+    // Handle error
+    return data;
+  }
+
+  if (EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_E, &data.e) <= 0) {
+    // Handle error
+    BN_free(data.n);
+    return data;
+  }
+
+  return data;
+}
+
+void rsa_pub_key_t::convert(coinbase::converter_t& converter) {
+  uint8_t parts = 0;
+  bn_t e, n;
+
+  if (converter.is_write()) {
+    data_t data = get();
+
+    if (data.e) {
+      parts |= part_e;
+      e = bn_t(data.e);
+    }
+    if (data.n) {
+      parts |= part_n;
+      n = bn_t(data.n);
+    }
+
+    BN_free(data.n);
+    BN_free(data.e);
+  }
+
+  converter.convert(parts);
+
+  if (converter.is_error()) return;
+  if (parts & part_e) converter.convert(e);
+  if (parts & part_n) converter.convert(n);
+
+  if (!converter.is_write() && !converter.is_error()) {
+    create();
+    switch (parts) {
+      case 0:
+        break;
+      case part_e | part_n:
+        if (error_t rv = validate_rsa_public_components(n, e)) {
+          converter.set_error(rv);
+          free();
+          return;
+        }
+        set(n, e);
+        break;
+      default:
+        converter.set_error();
+        free();
+        return;
+    }
+  }
+}
+
+// ------------------------------ rsa_prv_key_t -------------------------
+
+error_t rsa_prv_key_t::execute(mem_t enc_info, buf_t& dec_info) const {
+  return rsa_oaep_t(*this).execute(hash_e::sha256, hash_e::sha256, mem_t(), enc_info, dec_info);
+}
+
+error_t rsa_prv_key_t::sign_pkcs1(mem_t in, hash_e hash_alg, buf_t& signature) const {
+  buf_t buf;
+
+  unsigned int signature_size = size();
+  signature.alloc(signature_size);
+
+  cb_assert(hash_alg != hash_e::none);
+  scoped_ptr_t<EVP_PKEY_CTX> ctx = EVP_PKEY_CTX_new(ptr, NULL);
+  if (EVP_PKEY_sign_init(ctx) <= 0) return openssl_error("RSA sign error");
+  if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) <= 0) return openssl_error("RSA sign error");
+  if (EVP_PKEY_CTX_set_signature_md(ctx, hash_alg_t::get(hash_alg).md) <= 0) return openssl_error("RSA sign error");
+  size_t sig_len = signature_size;
+  if (EVP_PKEY_sign(ctx, signature.data(), &sig_len, in.data, in.size) <= 0) return openssl_error("RSA sign error");
+  return SUCCESS;
+}
+
+error_t rsa_prv_key_t::decrypt_raw(mem_t in, buf_t& out) const {
+  int n_size = size();
+  if (in.size != n_size) return coinbase::error(E_CRYPTO);
+
+  scoped_ptr_t<EVP_PKEY_CTX> ctx = EVP_PKEY_CTX_new(ptr, NULL);
+  if (EVP_PKEY_decrypt_init(ctx) <= 0) return openssl_error("RSA decrypt RAW error");
+  if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_NO_PADDING) <= 0) return openssl_error("RSA decrypt RAW error");
+  size_t outlen = n_size;
+  if (EVP_PKEY_decrypt(ctx, out.alloc(n_size), &outlen, in.data, in.size) <= 0)
+    return openssl_error("RSA decrypt RAW error");
+  return SUCCESS;
+}
+
+void rsa_prv_key_t::create() { free(); }
+
+void rsa_prv_key_t::generate(int bits) {
+  create();
+  ptr = EVP_RSA_gen(bits);
+  cb_assert(ptr);
+}
+
+int rsa_prv_key_t::size() const {
+  if (!ptr) return 0;
+  return EVP_PKEY_get_size(ptr);
+}
+
+rsa_prv_key_t::data_t rsa_prv_key_t::get(const RSA_BASE* rsa) {
+  data_t data;
+
+  OSSL_PARAM* params = NULL;
+  cb_assert(EVP_PKEY_todata(rsa, EVP_PKEY_PUBLIC_KEY, &params));
+  const OSSL_PARAM* param_e = OSSL_PARAM_locate_const(params, "e");
+  cb_assert(param_e);
+  BIGNUM* e_ptr = data.e;
+  const OSSL_PARAM* param_n = OSSL_PARAM_locate_const(params, "n");
+  cb_assert(param_n);
+  BIGNUM* n_ptr = data.n;
+  cb_assert(OSSL_PARAM_get_BN(param_e, &e_ptr) > 0);
+  cb_assert(OSSL_PARAM_get_BN(param_n, &n_ptr) > 0);
+  OSSL_PARAM_free(params);
+
+  params = NULL;
+  cb_assert(EVP_PKEY_todata(rsa, EVP_PKEY_PRIVATE_KEY, &params));
+  const OSSL_PARAM* param_p = OSSL_PARAM_locate_const(params, "rsa-factor1");
+  cb_assert(param_p);
+  BIGNUM* p_ptr = data.p;
+  const OSSL_PARAM* param_q = OSSL_PARAM_locate_const(params, "rsa-factor2");
+  cb_assert(param_q);
+  BIGNUM* q_ptr = data.q;
+  cb_assert(OSSL_PARAM_get_BN(param_p, &p_ptr) > 0);
+  cb_assert(OSSL_PARAM_get_BN(param_q, &q_ptr) > 0);
+  OSSL_PARAM_free(params);
+
+  return data;
+}
+
+void rsa_prv_key_t::set(RSA_BASE*& rsa, const BIGNUM* n, const BIGNUM* e, const BIGNUM* d) {
+  cb_assert(n && e && d);
+  OSSL_PARAM_BLD* param_bld = OSSL_PARAM_BLD_new();
+  cb_assert(param_bld);
+
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_N, n) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_E, e) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_D, d) > 0);
+
+  OSSL_PARAM* params = OSSL_PARAM_BLD_to_param(param_bld);
+  cb_assert(params);
+
+  scoped_ptr_t<EVP_PKEY_CTX> ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+  cb_assert(ctx);
+  cb_assert(EVP_PKEY_fromdata_init(ctx) > 0);
+  cb_assert(EVP_PKEY_fromdata(ctx, &rsa, EVP_PKEY_KEYPAIR, params) > 0);
+
+  OSSL_PARAM_free(params);
+  OSSL_PARAM_BLD_free(param_bld);
+}
+
+void rsa_prv_key_t::set(RSA_BASE*& rsa, const BIGNUM* n, const BIGNUM* e, const BIGNUM* d, const BIGNUM* p,
+                        const BIGNUM* q) {
+  cb_assert(n && e && d && p && q);
+  OSSL_PARAM_BLD* param_bld = OSSL_PARAM_BLD_new();
+  cb_assert(param_bld);
+
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_N, n) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_E, e) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_D, d) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_FACTOR1, p) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_FACTOR2, q) > 0);
+
+  OSSL_PARAM* params = OSSL_PARAM_BLD_to_param(param_bld);
+  cb_assert(params);
+
+  scoped_ptr_t<EVP_PKEY_CTX> ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+  cb_assert(ctx);
+  cb_assert(EVP_PKEY_fromdata_init(ctx) > 0);
+  cb_assert(EVP_PKEY_fromdata(ctx, &rsa, EVP_PKEY_KEYPAIR, params) > 0);
+
+  OSSL_PARAM_free(params);
+  OSSL_PARAM_BLD_free(param_bld);
+}
+
+void rsa_prv_key_t::set(RSA_BASE*& rsa, const BIGNUM* n, const BIGNUM* e, const BIGNUM* d, const BIGNUM* p,
+                        const BIGNUM* q, const BIGNUM* dp, const BIGNUM* dq, const BIGNUM* qinv) {
+  cb_assert(n && e && d && p && q && dp && dq && qinv);
+  OSSL_PARAM_BLD* param_bld = OSSL_PARAM_BLD_new();
+  cb_assert(param_bld);
+
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_N, n) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_E, e) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_D, d) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_FACTOR1, p) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_FACTOR2, q) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_EXPONENT1, dp) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_EXPONENT2, dq) > 0);
+  cb_assert(OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_COEFFICIENT1, qinv) > 0);
+
+  OSSL_PARAM* params = OSSL_PARAM_BLD_to_param(param_bld);
+  cb_assert(params);
+
+  scoped_ptr_t<EVP_PKEY_CTX> ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+  cb_assert(ctx);
+  cb_assert(EVP_PKEY_fromdata_init(ctx) > 0);
+  cb_assert(EVP_PKEY_fromdata(ctx, &rsa, EVP_PKEY_KEYPAIR, params) > 0);
+
+  OSSL_PARAM_free(params);
+  OSSL_PARAM_BLD_free(param_bld);
+}
+
+void rsa_prv_key_t::set(RSA_BASE*& rsa, const data_t& data) {
+  // Require full factors to reconstruct.
+  if (data.n == 0 || data.e == 0 || data.p == 0 || data.q == 0) {
+    cb_assert(false && "Incomplete RSA private key data");
+    return;
+  }
+
+  // Validate n == p*q.
+  bn_t n_check = data.p * data.q;
+  if (n_check != data.n) {
+    cb_assert(false && "Invalid RSA key data (n != p*q)");
+    return;
+  }
+
+  const bn_t p_minus_1 = data.p - 1;
+  const bn_t q_minus_1 = data.q - 1;
+  const bn_t phi_n = p_minus_1 * q_minus_1;
+
+  // Compute d = e^{-1} mod phi(n).
+  bn_t d;
+  {
+    vartime_scope_t scope;
+    auto res = BN_mod_inverse(d, data.e, phi_n, bn_t::thread_local_storage_bn_ctx());
+    cb_assert(res);
+  }
+
+  // CRT parameters.
+  bn_t dp;
+  bn_t::div(d, p_minus_1, &dp);
+  bn_t dq;
+  bn_t::div(d, q_minus_1, &dq);
+
+  bn_t qinv;
+  {
+    vartime_scope_t scope;
+    auto res = BN_mod_inverse(qinv, data.q, data.p, bn_t::thread_local_storage_bn_ctx());
+    cb_assert(res);
+  }
+
+  set(rsa, data.n, data.e, d, data.p, data.q, dp, dq, qinv);
+}
+
+void rsa_prv_key_t::convert(coinbase::converter_t& converter) {
+  uint8_t parts = 0;
+  bn_t e, n, p, q;
+
+  if (converter.is_write()) {
+    data_t data = get();
+    if (data.e != 0) {
+      parts |= part_e;
+      e = data.e;
+    }
+    if (data.n != 0) {
+      parts |= part_n;
+      n = data.n;
+    }
+    if (data.p != 0) {
+      parts |= part_p;
+      p = data.p;
+    }
+    if (data.q != 0) {
+      parts |= part_q;
+      q = data.q;
+    }
+  }
+
+  converter.convert(parts);
+  if (converter.is_error()) return;
+
+  if (parts & part_e) converter.convert(e);
+  if (parts & part_n) converter.convert(n);
+  if (parts & part_p) converter.convert(p);
+  if (parts & part_q) converter.convert(q);
+
+  if (!converter.is_write() && !converter.is_error()) {
+    create();
+    switch (parts) {
+      case 0:
+        break;
+      case part_e | part_n | part_p | part_q: {
+        data_t data;
+        data.e = e;
+        data.n = n;
+        data.p = p;
+        data.q = q;
+        set(ptr, data);
+        break;
+      }
+      default:
+        converter.set_error();
+        free();
+        return;
+    }
+  }
+}
+
+rsa_pub_key_t rsa_prv_key_t::pub() const {
+  rsa_pub_key_t pub_key;
+  pub_key.set(get_n(), get_e());
+  return pub_key;
+}
+
+error_t rsa_oaep_t::execute(hash_e hash_alg, hash_e mgf_alg, mem_t label, mem_t in, buf_t& out) const {
+  error_t rv = UNINITIALIZED_ERROR;
+  if (!hash_alg_t::get(hash_alg).valid()) return coinbase::error(E_BADARG);
+  if (!hash_alg_t::get(mgf_alg).valid()) return coinbase::error(E_BADARG);
+
+  if (key) {
+    if (rv = key->decrypt_oaep(in, hash_alg, mgf_alg, label, out)) return rv;
+    return SUCCESS;
+  }
+
+  if (rv = exec(ctx, int(hash_alg), int(mgf_alg), label, in, out)) return rv;
+  return SUCCESS;
+}
+
+error_t rsa_oaep_t::execute(void* ctx, int hash_alg, int mgf_alg, mem_t label, mem_t in, buf_t& out) {
+  error_t rv = UNINITIALIZED_ERROR;
+  if (!hash_alg_t::get(hash_e(hash_alg)).valid()) return coinbase::error(E_BADARG);
+  if (!hash_alg_t::get(hash_e(mgf_alg)).valid()) return coinbase::error(E_BADARG);
+
+  const rsa_prv_key_t* key = (const rsa_prv_key_t*)ctx;
+  if (rv = key->decrypt_oaep(in, hash_e(hash_alg), hash_e(mgf_alg), label, out)) return rv;
+  return SUCCESS;
+}
+
+}  // namespace coinbase::crypto

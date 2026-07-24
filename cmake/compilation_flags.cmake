@@ -1,0 +1,78 @@
+
+if(DEFINED CXXDEFS)
+  set(CMAKE_CXX_FLAGS "${CXXDEFS}")
+endif()
+
+set_cxx_flags("-std=c++17")
+set_cxx_flags("-fPIC")
+set_cxx_flags("-fstack-protector-strong")
+set_cxx_flags("-fvisibility=hidden")
+set_cxx_flags("-fno-operator-names")
+set_cxx_flags("-Wno-attributes")
+set_cxx_flags("-Wnull-dereference")
+set_cxx_flags("-Wno-parentheses")
+set_cxx_flags("-Wno-reorder")
+set_cxx_flags("-Wno-missing-braces")
+set_cxx_flags("-Wno-switch")
+set_cxx_flags("-Wno-switch-enum")
+set_cxx_flags("-Wno-sign-compare")
+set_cxx_flags("-Wno-strict-overflow")
+set_cxx_flags("-Wno-unused")
+set_cxx_flags("-Werror")
+set_cxx_flags("-Wno-error=null-dereference")
+set_cxx_flags("-Wno-shorten-64-to-32")
+set_cxx_flags("-DNO_DEPRECATED_OPENSSL")
+if(IS_LINUX AND ENABLE_O3)
+  # Enable fortified libc wrappers where supported (glibc, optimized builds).
+  set_cxx_flags("-D_FORTIFY_SOURCE=2")
+endif()
+
+if(IS_CLANG)
+  set_cxx_flags("-Wno-tautological-undefined-compare")
+  set_cxx_flags("-Wno-#pragma-messages")
+  set_cxx_flags("-Wno-vla-extension")
+  set_cxx_flags("-Wno-error=deprecated-declarations")
+else()
+  set_cxx_flags("-Wmaybe-uninitialized")
+  set_cxx_flags("-Wno-error=maybe-uninitialized")
+endif()
+
+if(IS_ARM64)
+  set(CMAKE_ARCH "arm64")
+  set_cxx_flags("-march=armv8-a+crypto")
+endif()
+
+if(IS_X86_64)
+  set(CMAKE_ARCH "x86_64")
+  set_cxx_flags("-mpclmul -maes -msse4.1")
+endif()
+
+# Some linker hardening flags are incompatible with sanitizer runtimes.
+# In particular, `-Wl,--exclude-libs,ALL` breaks ASAN+UBSAN builds (gtest crashes
+# during test registration with a bad-free). Skip it for sanitizer builds so we
+# can run sanitizer lanes in CI and locally.
+set(_cbmpc_is_sanitized false)
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=" OR CMAKE_C_FLAGS MATCHES "-fsanitize=" OR
+   CMAKE_EXE_LINKER_FLAGS MATCHES "-fsanitize=" OR CMAKE_SHARED_LINKER_FLAGS MATCHES "-fsanitize=")
+  set(_cbmpc_is_sanitized true)
+endif()
+
+if(IS_LINUX)
+  if(NOT _cbmpc_is_sanitized)
+    set_link_flags("-Wl,--exclude-libs,ALL")
+  endif()
+  set_link_flags("-Wl,-z,defs")
+  set_link_flags("-z noexecstack -z nodelete")
+  link_libraries(pthread dl rt)
+  set(CMAKE_SKIP_BUILD_RPATH TRUE)
+endif()
+
+if(IS_MACOS)
+  set(CMAKE_MACOSX_RPATH 1)
+  set_link_flags("-framework CoreServices -framework IOKit")
+endif()
+
+message("======= Flags =======")
+message("CMAKE_CXX_FLAGS:                ${CMAKE_CXX_FLAGS}")
+message("CMAKE_SHARED_LINKER_FLAGS:      ${CMAKE_SHARED_LINKER_FLAGS}")
+message("CMAKE_EXE_LINKER_FLAGS:         ${CMAKE_EXE_LINKER_FLAGS}")
