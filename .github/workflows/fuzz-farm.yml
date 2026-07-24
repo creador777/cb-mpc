@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write   # write -> publicar corpus aprendido al pool compartido (enjambre)
 
 jobs:
   fuzz:
@@ -80,6 +80,19 @@ jobs:
           restore-keys: |
             cbmpc-corpus-${{ matrix.harness.bin }}-s${{ matrix.shard }}-
 
+      - name: Sembrar corpus desde el POOL (cerebro compartido del enjambre)
+        run: |
+          set +e
+          git clone --depth 1 --branch corpus-pool --single-branch \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" /tmp/pool 2>/dev/null
+          mkdir -p "fuzz/${{ matrix.harness.corpus }}"
+          if [ -d "/tmp/pool/${{ matrix.harness.bin }}" ]; then
+            rsync -a --ignore-existing "/tmp/pool/${{ matrix.harness.bin }}/" "fuzz/${{ matrix.harness.corpus }}/"
+            echo "sembrados desde el pool: $(find /tmp/pool/${{ matrix.harness.bin }} -type f ! -name '.gitkeep' | wc -l) inputs"
+          fi
+          rm -rf /tmp/pool
+          true
+
       - name: Compilar fuzzer + FUZZ
         id: fuzz
         env:
@@ -100,6 +113,29 @@ jobs:
             -seed=${{ matrix.shard }} -max_total_time="${FUZZTIME}" -artifact_prefix=hit_ "${{ matrix.harness.corpus }}" > fuzz.log 2>&1
           echo "rc=$?" >> "$GITHUB_OUTPUT"
           echo "----- tail fuzz.log -----"; tail -n 25 fuzz.log || true
+
+      - name: Publicar corpus aprendido al POOL (retry anti-colision)
+        if: always() && steps.fuzz.outputs.rc != '200'
+        run: |
+          set +e
+          for attempt in 1 2 3 4 5 6; do
+            rm -rf /tmp/pool
+            git clone --depth 1 --branch corpus-pool --single-branch \
+              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" /tmp/pool 2>/dev/null || { echo "no pude clonar el pool"; break; }
+            mkdir -p "/tmp/pool/${{ matrix.harness.bin }}"
+            rsync -a --ignore-existing "fuzz/${{ matrix.harness.corpus }}/" "/tmp/pool/${{ matrix.harness.bin }}/"
+            # nunca subir crashes crudos al pool publico (solo inputs de corpus)
+            rm -f /tmp/pool/${{ matrix.harness.bin }}/hit_* /tmp/pool/${{ matrix.harness.bin }}/crash-* 2>/dev/null
+            cd /tmp/pool
+            git config user.email "bot@fuzz"; git config user.name "cloud-${{ matrix.harness.bin }}-s${{ matrix.shard }}"
+            git add -A
+            if git diff --cached --quiet; then echo "sin aportes nuevos al pool"; cd "$GITHUB_WORKSPACE"; break; fi
+            n=$(git diff --cached --name-only | wc -l)
+            git commit -q -m "cloud ${{ matrix.harness.bin }} s${{ matrix.shard }}: +$n inputs al pool"
+            if git push origin corpus-pool 2>/dev/null; then echo "publicados $n inputs al pool (intento $attempt)"; cd "$GITHUB_WORKSPACE"; break; fi
+            echo "colision de push, reintento $attempt..."; cd "$GITHUB_WORKSPACE"; sleep $((RANDOM % 8 + 3))
+          done
+          true
 
       - name: Clasificar (ALTO VALOR vs DoS is_in_range)
         id: classify
