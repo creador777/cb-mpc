@@ -1,0 +1,77 @@
+name: sniper-codeql
+
+# ============================================================================
+#  FRANCOTIRADOR ESTATICO — CodeQL sobre cb-mpc (Coinbase).
+#  Analisis de dataflow/seguridad de C++ que caza bugs (memoria, enteros, uso
+#  despues de free, etc.) en TODO el codigo — incluso donde el fuzzer no llega.
+#  Corre 1x/dia (huecos) + on-demand. Resultados -> pestana Security del repo.
+#  Nota: usa el build PROBADO de la granja (bash fuzz/build_fuzz_malicious.sh)
+#  para que CodeQL observe la compilacion real de la libreria.
+# ============================================================================
+
+on:
+  schedule:
+    - cron: '30 3 * * *'   # 03:30 UTC diario, desfasado del fuzzing
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write   # para subir resultados a la pestana Security
+
+concurrency:
+  group: sniper-codeql
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar LLVM 20 + deps (igual que el Dockerfile)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev cmake rsync wget gnupg ca-certificates lsb-release
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-20 lld-20 llvm-20 libfuzzer-20-dev libclang-rt-20-dev
+
+      - name: Cache OpenSSL 3.6.1 estatico
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/opt/openssl@3.6.1
+          key: openssl-3.6.1-${{ runner.os }}-clang20-v1
+
+      - name: Build OpenSSL 3.6.1 (si no esta cacheado)
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /usr/local/opt
+          sudo chown -R "$USER" /usr/local/opt
+          workdir="$(mktemp -d)"
+          cp scripts/openssl/build-static-openssl-linux.sh "$workdir/"
+          ( cd "$workdir" && CC=clang-20 CXX=clang++-20 sh build-static-openssl-linux.sh )
+
+      - name: Inicializar CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          queries: security-extended,security-and-quality
+
+      - name: Compilar cb-mpc (CodeQL observa la compilacion)
+        env:
+          CC: clang-20
+          CXX: clang++-20
+          CBMPC_OPENSSL_ROOT: /usr/local/opt/openssl@3.6.1
+        run: |
+          set -e
+          bash fuzz/build_fuzz_malicious.sh
+
+      - name: Analizar con CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:c-cpp"
