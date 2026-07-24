@@ -2,14 +2,15 @@ name: fuzz-farm-cbmpc
 
 # ============================================================================
 #  GRANJA 24/7 — cb-mpc (Coinbase) para bug bounty HackerOne.
-#  Caza panics/breaks en los protocolos MPC via API publica (modelo del bounty).
-#   - 12 maquinas en paralelo (4 shards x 3 harnesses), cada una su corpus.
-#   - concurrency cancel-in-progress -> nunca se apila ni se atasca.
+#  18 maquinas en paralelo (6 shards x 3 harnesses) ~= 72 nucleos.
+#   - cada shard con SEMILLA distinta -> exploran caminos diferentes (no clones).
 #   - corpus cacheado por shard -> NO se pierde lo aprendido entre runs.
+#   - fuzztime 4h < cron 6h -> los runs COMPLETAN y guardan el corpus aunque
+#     el cron de GitHub llegue tarde (clave: antes se cortaban y no persistian).
+#   - concurrency cancel-in-progress -> nunca se apila.
 #   - clasificacion: DoS is_in_range (Low, conocido) NO alerta;
 #     forgery/nonce-reuse/key-leak/memoria (ALTO VALOR $15K-$50K) -> email.
-#   - crash cifrado con GPG si existe el secret GPG_PUBLIC_KEY (disclosure
-#     responsable: sin GPG no se sube el crash crudo a un repo publico).
+#   - crash cifrado con GPG si existe el secret GPG_PUBLIC_KEY.
 #  Build replicado del Dockerfile del repo: clang-20 + OpenSSL 3.6.1 estatico.
 # ============================================================================
 
@@ -34,12 +35,12 @@ jobs:
           - { bin: fuzz_malicious,    build: build_fuzz_malicious.sh, corpus: corpus }
           - { bin: fuzz_malicious_mp, build: build_fuzz_malicious.sh, corpus: corpus_mp }
           - { bin: fuzz_schnorr,      build: build_fuzz_schnorr.sh,   corpus: corpus_schnorr }
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 300
     env:
       GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
-      FUZZTIME: '16800'   # 4h40m; deja margen para el build bajo el timeout de 355min
+      FUZZTIME: '14400'   # 4h; < cron 6h -> el run completa y guarda corpus aun con cron tardio
     steps:
       - uses: actions/checkout@v4
 
@@ -91,10 +92,11 @@ jobs:
           if [ "$brc" != "0" ]; then echo "BUILD FAILED rc=$brc"; echo "rc=200" >> "$GITHUB_OUTPUT"; exit 0; fi
           cd fuzz
           mkdir -p "${{ matrix.harness.corpus }}"
+          # semilla distinta por shard -> cada maquina explora un camino diferente
           ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:symbolize=1:handle_abort=1:handle_segv=1 \
           UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             ./"${{ matrix.harness.bin }}" -fork=2 -ignore_crashes=1 -rss_limit_mb=4096 -timeout=25 \
-            -max_total_time="${FUZZTIME}" -artifact_prefix=hit_ "${{ matrix.harness.corpus }}" > fuzz.log 2>&1
+            -seed=${{ matrix.shard }} -max_total_time="${FUZZTIME}" -artifact_prefix=hit_ "${{ matrix.harness.corpus }}" > fuzz.log 2>&1
           echo "rc=$?" >> "$GITHUB_OUTPUT"
           echo "----- tail fuzz.log -----"; tail -n 25 fuzz.log || true
 
