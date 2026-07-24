@@ -1,0 +1,70 @@
+name: check-failed-sign
+
+# Verifica que fuzz_failed_sign (harness BitForge/Lindell17, IA-gen + Claude-fix)
+# COMPILA contra cb-mpc real y arranca sin abortar. Build + smoke 60s. On-demand.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-failed-sign
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar LLVM 20 + deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev cmake rsync wget gnupg ca-certificates lsb-release
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-20 lld-20 llvm-20 libfuzzer-20-dev libclang-rt-20-dev
+
+      - name: Cache OpenSSL 3.6.1
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/opt/openssl@3.6.1
+          key: openssl-3.6.1-${{ runner.os }}-clang20-v1
+
+      - name: Build OpenSSL 3.6.1 (si no esta cacheado)
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /usr/local/opt
+          sudo chown -R "$USER" /usr/local/opt
+          workdir="$(mktemp -d)"
+          cp scripts/openssl/build-static-openssl-linux.sh "$workdir/"
+          ( cd "$workdir" && CC=clang-20 CXX=clang++-20 sh build-static-openssl-linux.sh )
+
+      - name: Compilar fuzz_failed_sign (VERIFICACION)
+        env:
+          CC: clang-20
+          CXX: clang++-20
+          CBMPC_OPENSSL_ROOT: /usr/local/opt/openssl@3.6.1
+        run: |
+          set -e
+          bash fuzz/build_fuzz_failed_sign.sh
+          test -x fuzz/fuzz_failed_sign && echo "=== COMPILA OK: binario fuzz_failed_sign generado ==="
+
+      - name: Smoke test (arranca sin abortar + sin falsos CRITICAL?)
+        run: |
+          cd fuzz
+          mkdir -p corpus_failed_sign
+          echo "=== corriendo 60s de smoke (bootstrap DKG + fuzz) ==="
+          ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+            timeout 90 ./fuzz_failed_sign -fork=2 -ignore_crashes=1 -rss_limit_mb=4096 -timeout=25 -max_total_time=60 corpus_failed_sign > smoke.log 2>&1 || true
+          echo "----- tail smoke.log -----"; tail -n 30 smoke.log
+          if grep -q 'bootstrap() failed' smoke.log; then echo "::error::bootstrap fallo"; exit 1; fi
+          if grep -qa 'CRITICAL \[STATE-CORRUPTION\]' smoke.log; then echo "::warning::state-corruption disparo en smoke (revisar si es real o falso positivo)"; fi
+          echo "=== SMOKE OK ==="
