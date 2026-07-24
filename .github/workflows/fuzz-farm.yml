@@ -117,7 +117,7 @@ jobs:
           path: fuzz/hit.tgz.gpg
           retention-days: 30
 
-      - name: Subir SOLO firma (sin GPG: no filtrar crash a repo publico)
+      - name: "Subir SOLO firma (sin GPG: no filtrar crash a repo publico)"
         if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY == ''
         run: |
           cd fuzz
