@@ -35,7 +35,7 @@ jobs:
           - { bin: fuzz_malicious,    build: build_fuzz_malicious.sh, corpus: corpus }
           - { bin: fuzz_malicious_mp, build: build_fuzz_malicious.sh, corpus: corpus_mp }
           - { bin: fuzz_schnorr,      build: build_fuzz_schnorr.sh,   corpus: corpus_schnorr }
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5]   # 15 jobs fuzzeando; deja ~5 slots libres para check/codeql/tdh2
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
