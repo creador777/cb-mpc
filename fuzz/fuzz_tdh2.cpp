@@ -230,8 +230,9 @@ static bool load_buf(const char* path, buf_t& out) {
   return true;
 }
 
+template <typename F0, typename F1, typename F2>
 static void run_3pc_dkg(const std::shared_ptr<network_t>& net,
-                        auto&& f0, auto&& f1, auto&& f2,
+                        F0&& f0, F1&& f1, F2&& f2,
                         error_t& rv0, error_t& rv1, error_t& rv2) {
   net->reset_abort();
   rv0 = rv1 = rv2 = E_GENERAL;
@@ -280,9 +281,9 @@ static bool bootstrap_dkg() {
 
   error_t r0, r1, r2;
   run_3pc_dkg(net,
-    [&] { return coinbase::api::tdh2::dkg_additive(j0, curve_id::secp256k1, pk0, ps0, sk0, sid0); },
-    [&] { return coinbase::api::tdh2::dkg_additive(j1, curve_id::secp256k1, pk1, ps1, sk1, sid1); },
-    [&] { return coinbase::api::tdh2::dkg_additive(j2, curve_id::secp256k1, pk2, ps2, sk2, sid2); },
+    [&] { return coinbase::api::tdh2::dkg_additive(j0, coinbase::api::curve_id::secp256k1, pk0, ps0, sk0, sid0); },
+    [&] { return coinbase::api::tdh2::dkg_additive(j1, coinbase::api::curve_id::secp256k1, pk1, ps1, sk1, sid1); },
+    [&] { return coinbase::api::tdh2::dkg_additive(j2, coinbase::api::curve_id::secp256k1, pk2, ps2, sk2, sid2); },
     r0, r1, r2);
 
   if (r0 != SUCCESS || r1 != SUCCESS || r2 != SUCCESS) {
@@ -860,9 +861,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
           to_mem(g_public_key), to_mem(ciphertext), evil_label);
 
       // Si verify con label incorrecta pasa → bug (label binding)
-      if (vrv == SUCCESS && !(label.data()[0] == evil_label.data()[0] &&
+      if (vrv == SUCCESS && !(label.data[0] == evil_label.data[0] &&
            label.size == evil_label.size &&
-           std::memcmp(label.data(), evil_label.data(), label.size) == 0)) {
+           std::memcmp(label.data, evil_label.data, label.size) == 0)) {
         std::fprintf(stderr,
           "\n\n========================================\n"
           "CRITICAL [O3-LABEL-CONFUSION-VERIFY] verify ACEPTA ciphertext\n"
@@ -902,7 +903,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       // Use resize-like approach: create new buf_t with extra bytes
       std::vector<uint8_t> tmp(extended.data(), extended.data() + extended.size());
       for (size_t i = 0; i < garbage.size && tmp.size() < 8192; i++)
-        tmp.push_back(((const uint8_t*)garbage.data())[i]);
+        tmp.push_back(((const uint8_t*)garbage.data)[i]);
       partials[2] = buf_t(mem_t(tmp.data(), tmp.size()));
 
       for (int i = 0; i < 3; i++)
@@ -935,8 +936,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
           size_t off = (fuzzrng::next() % mutated.size());
           size_t len = std::min((size_t)(fuzzrng::next() % 64) + 1,
                                 mutated.size() - off);
-          for (size_t j = 0; j < len && j < evil.size(); j++) {
-            mutated.data()[off + j] ^= ((const uint8_t*)evil.data())[j];
+          for (size_t j = 0; j < len && j < evil.size; j++) {
+            mutated.data()[off + j] ^= ((const uint8_t*)evil.data)[j];
           }
         }
         combine_partials.push_back(mutated);
@@ -984,7 +985,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   // [O1] INTEGRITY-BREAK: combine SUCCESS pero plaintext != original
   if (combine_rv == SUCCESS) {
     bool same_plaintext = (plaintext_out.size() == (int)pt_len &&
-                           std::memcmp(plaintext_out.data(), plaintext.data(),
+                           std::memcmp(plaintext_out.data(), plaintext.data,
                                        pt_len) == 0);
 
     if (!same_plaintext) {
@@ -1017,9 +1018,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       bool is_suffix = false;
       if (plaintext_out.size() > 0 && pt_len > 0) {
         size_t min_len = std::min((size_t)plaintext_out.size(), pt_len);
-        is_prefix = (std::memcmp(plaintext_out.data(), plaintext.data(), min_len) == 0);
+        is_prefix = (std::memcmp(plaintext_out.data(), plaintext.data, min_len) == 0);
         is_suffix = (std::memcmp(plaintext_out.data() + plaintext_out.size() - min_len,
-                                 plaintext.data() + pt_len - min_len, min_len) == 0);
+                                 plaintext.data + pt_len - min_len, min_len) == 0);
       }
 
       if (is_prefix || is_suffix) {
