@@ -3,8 +3,10 @@ name: fuzz-farm-cbmpc
 # ============================================================================
 #  GRANJA 24/7 — cb-mpc (Coinbase) para bug bounty HackerOne.
 #  Caza panics/breaks en los protocolos MPC via API publica (modelo del bounty).
+#   - 12 maquinas en paralelo (4 shards x 3 harnesses), cada una su corpus.
 #   - concurrency cancel-in-progress -> nunca se apila ni se atasca.
-#   - clasificacion: el DoS is_in_range (ya conocido, Low) NO alerta;
+#   - corpus cacheado por shard -> NO se pierde lo aprendido entre runs.
+#   - clasificacion: DoS is_in_range (Low, conocido) NO alerta;
 #     forgery/nonce-reuse/key-leak/memoria (ALTO VALOR $15K-$50K) -> email.
 #   - crash cifrado con GPG si existe el secret GPG_PUBLIC_KEY (disclosure
 #     responsable: sin GPG no se sube el crash crudo a un repo publico).
@@ -28,10 +30,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { harness: fuzz_malicious,    build: build_fuzz_malicious.sh, corpus: corpus }
-          - { harness: fuzz_malicious_mp, build: build_fuzz_malicious.sh, corpus: corpus_mp }
-          - { harness: fuzz_schnorr,      build: build_fuzz_schnorr.sh,   corpus: corpus_schnorr }
+        harness:
+          - { bin: fuzz_malicious,    build: build_fuzz_malicious.sh, corpus: corpus }
+          - { bin: fuzz_malicious_mp, build: build_fuzz_malicious.sh, corpus: corpus_mp }
+          - { bin: fuzz_schnorr,      build: build_fuzz_schnorr.sh,   corpus: corpus_schnorr }
+        shard: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 355
     env:
@@ -67,13 +70,13 @@ jobs:
           cp scripts/openssl/build-static-openssl-linux.sh "$workdir/"
           ( cd "$workdir" && CC=clang-20 CXX=clang++-20 sh build-static-openssl-linux.sh )
 
-      - name: Restaurar corpus (persiste lo APRENDIDO entre runs)
+      - name: Restaurar corpus por shard (persiste lo APRENDIDO entre runs)
         uses: actions/cache@v4
         with:
-          path: fuzz/${{ matrix.corpus }}
-          key: cbmpc-corpus-${{ matrix.harness }}-${{ github.run_id }}
+          path: fuzz/${{ matrix.harness.corpus }}
+          key: cbmpc-corpus-${{ matrix.harness.bin }}-s${{ matrix.shard }}-${{ github.run_id }}
           restore-keys: |
-            cbmpc-corpus-${{ matrix.harness }}-
+            cbmpc-corpus-${{ matrix.harness.bin }}-s${{ matrix.shard }}-
 
       - name: Compilar fuzzer + FUZZ
         id: fuzz
@@ -83,15 +86,15 @@ jobs:
           CBMPC_OPENSSL_ROOT: /usr/local/opt/openssl@3.6.1
         run: |
           set +e
-          bash "fuzz/${{ matrix.build }}"
+          bash "fuzz/${{ matrix.harness.build }}"
           brc=$?
           if [ "$brc" != "0" ]; then echo "BUILD FAILED rc=$brc"; echo "rc=200" >> "$GITHUB_OUTPUT"; exit 0; fi
           cd fuzz
-          mkdir -p "${{ matrix.corpus }}"
+          mkdir -p "${{ matrix.harness.corpus }}"
           ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:symbolize=1:handle_abort=1:handle_segv=1 \
           UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-            ./"${{ matrix.harness }}" -fork=2 -ignore_crashes=1 -rss_limit_mb=4096 -timeout=25 \
-            -max_total_time="${FUZZTIME}" -artifact_prefix=hit_ "${{ matrix.corpus }}" > fuzz.log 2>&1
+            ./"${{ matrix.harness.bin }}" -fork=2 -ignore_crashes=1 -rss_limit_mb=4096 -timeout=25 \
+            -max_total_time="${FUZZTIME}" -artifact_prefix=hit_ "${{ matrix.harness.corpus }}" > fuzz.log 2>&1
           echo "rc=$?" >> "$GITHUB_OUTPUT"
           echo "----- tail fuzz.log -----"; tail -n 25 fuzz.log || true
 
@@ -104,7 +107,7 @@ jobs:
           if grep -aE 'CRITICAL \[(NONCE-REUSE|R-INFINITY|KEY-LEAK|SCHNORR-FORGERY|SIGN-BREAK|MP-SIGN-BREAK|REFRESH-BREAK|MP-REFRESH-BREAK)\]' fuzz.log >/dev/null 2>&1; then NEW=1; fi
           if grep -aE 'SUMMARY: (AddressSanitizer|UndefinedBehaviorSanitizer|MemorySanitizer): (heap-buffer-overflow|heap-use-after-free|use-after-free|stack-buffer-overflow|global-buffer-overflow|double-free|stack-overflow|SEGV|out-of-bounds)' fuzz.log 2>/dev/null | grep -av 'is_in_range' >/dev/null 2>&1; then NEW=1; fi
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
-          if [ "$NEW" = "1" ]; then echo "::warning::HIT ALTO VALOR en ${{ matrix.harness }} — revisar."; else echo "sin hits de alto valor (solo DoS/ruido)"; fi
+          if [ "$NEW" = "1" ]; then echo "::warning::HIT ALTO VALOR en ${{ matrix.harness.bin }} shard ${{ matrix.shard }}."; else echo "sin hits de alto valor (solo DoS/ruido)"; fi
 
       - name: Cifrar hit (solo si hay secret GPG)
         if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY != ''
@@ -121,7 +124,7 @@ jobs:
         if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY != ''
         uses: actions/upload-artifact@v4
         with:
-          name: HIT-${{ matrix.harness }}
+          name: HIT-${{ matrix.harness.bin }}-s${{ matrix.shard }}
           path: fuzz/hit.tgz.gpg
           retention-days: 30
 
@@ -129,20 +132,20 @@ jobs:
         if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY == ''
         run: |
           cd fuzz
-          { echo "HIT ALTO VALOR en ${{ matrix.harness }}"; grep -aE 'CRITICAL \[|SUMMARY:' fuzz.log | grep -av 'is_in_range' | head -20; echo "(sin GPG: crash crudo NO subido. Setea el secret GPG_PUBLIC_KEY para captura cifrada.)"; } > hit_signature.txt
+          { echo "HIT ALTO VALOR en ${{ matrix.harness.bin }} shard ${{ matrix.shard }}"; grep -aE 'CRITICAL \[|SUMMARY:' fuzz.log | grep -av 'is_in_range' | head -20; echo "(sin GPG: crash crudo NO subido. Setea el secret GPG_PUBLIC_KEY para captura cifrada.)"; } > hit_signature.txt
 
       - name: Subir firma
         if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY == ''
         uses: actions/upload-artifact@v4
         with:
-          name: HIT-SIGNATURE-${{ matrix.harness }}
+          name: HIT-SIGNATURE-${{ matrix.harness.bin }}-s${{ matrix.shard }}
           path: fuzz/hit_signature.txt
           retention-days: 30
 
       - name: Marcar fallo si HIT (dispara email a tu Gmail)
         if: steps.classify.outputs.new == '1'
         run: |
-          echo "HIT ALTO VALOR en ${{ matrix.harness }} — revisar artifact."
+          echo "HIT ALTO VALOR en ${{ matrix.harness.bin }} shard ${{ matrix.shard }} — revisar artifact."
           exit 1
 
       - name: Avisar si el build fallo
