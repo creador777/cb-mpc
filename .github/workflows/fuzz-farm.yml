@@ -226,6 +226,33 @@ jobs:
           done
           true
 
+      # RUTA B (independiente de git): el mismo resumen como ARTEFACTO de GitHub.
+      # Si el push a corpus-pool falla (colision, token vencido, rama protegida),
+      # esta ruta sigue funcionando: el artefacto vive 30 dias y el colector local
+      # lo ve por la API. Solo metadata, nunca el input crudo (repo publico).
+      - name: "RUTA B: resumen como artefacto"
+        if: always() && steps.fuzz.outputs.rc != '200' && (steps.classify.outputs.ncrash != '0' || steps.classify.outputs.ntimeout != '0')
+        run: |
+          cd fuzz
+          {
+            echo "harness=${{ matrix.harness.bin }}"
+            echo "shard=${{ matrix.shard }}"
+            echo "crashes=${{ steps.classify.outputs.ncrash }}"
+            echo "timeouts=${{ steps.classify.outputs.ntimeout }}"
+            echo "alto_valor=${{ steps.classify.outputs.new }}"
+            grep -aE 'ERROR: (AddressSanitizer|libFuzzer)|SUMMARY:|CRITICAL \[|Assertion failed' fuzz.log 2>/dev/null \
+              | sed -E 's/0x[0-9a-f]+/0xN/g; s/[0-9]{5,}/N/g' | sort -u | head -10
+          } > resumen_hallazgo.txt
+          cat resumen_hallazgo.txt
+
+      - name: "RUTA B: subir resumen"
+        if: always() && steps.fuzz.outputs.rc != '200' && (steps.classify.outputs.ncrash != '0' || steps.classify.outputs.ntimeout != '0')
+        uses: actions/upload-artifact@v4
+        with:
+          name: HALLAZGO-${{ matrix.harness.bin }}-s${{ matrix.shard }}-${{ github.run_id }}
+          path: fuzz/resumen_hallazgo.txt
+          retention-days: 30
+
       - name: Cifrar hit (solo si hay secret GPG)
         if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY != ''
         run: |
