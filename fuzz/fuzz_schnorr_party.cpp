@@ -505,7 +505,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   // --- config de mutación (deriva del input) ---
   const uint8_t flags = fdp.ConsumeIntegral<uint8_t>();
   mut_cfg_t cfg;
-  cfg.enabled = true;
+  // P2 malicioso ~3 de cada 4 veces, NO siempre.
+  //
+  // Estaba en "true" fijo, y eso castraba el oraculo de mas valor. Medido
+  // 2026-07-25 con contadores dentro de schnorr_2p.cpp: en 128 ejecuciones con
+  // 2838 entradas de corpus, sign() devolvio SUCCESS **0 veces** y la rama BIP340
+  // no se alcanzo NUNCA. Con P2 mutando todos los mensajes el protocolo siempre
+  // aborta antes de firmar, y [SCHNORR-FORGERY] exige SUCCESS para poder mirar la
+  // firma -> se quedaba sin material que revisar.
+  //
+  // Consecuencia: un harness 100% adversario solo encuentra CRASHES (DoS). Los
+  // bugs de soundness ("acepto y el resultado esta mal") viven justo en el medio:
+  // mutaciones lo bastante sutiles como para que el protocolo COMPLETE y aun asi
+  // el resultado sea invalido. Sin corridas que completen, ese terreno no existe.
+  // Encaja con lo observado en dias de caza: solo aparecio el DoS is_in_range.
+  //
+  // Deriva del input (bits altos de flags) para no perder reproducibilidad.
+  cfg.enabled = ((flags >> 6) != 0);
   cfg.enable_semantic = (flags & 0x01u);
   cfg.enable_reorder = (flags & 0x02u);
   if (flags & 0x08u) cfg.forced_mode = 1;
