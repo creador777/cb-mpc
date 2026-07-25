@@ -21,7 +21,14 @@ on:
 
 concurrency:
   group: fuzz-farm-cbmpc
-  cancel-in-progress: true
+  # NO cancelar el run en curso. Medido 2026-07-25: con cancel-in-progress:true los
+  # 10 ultimos runs murieron CANCELADOS, cada uno justo al nacer el siguiente (uno
+  # llevaba 393 min). La cuenta: cola (~3.6h) + build (~0.5h) + fuzz (4h) = ~8h > cron 6h,
+  # asi que el cron siguiente SIEMPRE lo mataba antes de terminar -> nunca completaba,
+  # nunca publicaba corpus al pool, nunca alertaba. Bucle infinito que se sostiene solo.
+  # Con false el run nuevo ESPERA (GitHub mantiene 1 corriendo + 1 pendiente como mucho,
+  # asi que tampoco se apila).
+  cancel-in-progress: false
 
 permissions:
   contents: write   # write -> publicar corpus aprendido al pool compartido (enjambre)
