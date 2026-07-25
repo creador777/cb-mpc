@@ -556,6 +556,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   std::vector<mem_t> combine_public_shares = to_mem_vec(g_public_shares);
   buf_t plaintext_out;
 
+  // Plaintext que DEBE salir si combine tiene exito. Por defecto el original, pero
+  // hay modos que cifran OTRO plaintext y le pasan a combine un (ciphertext,partials)
+  // consistente entre si: ahi lo correcto es que salga ESE otro plaintext, no el
+  // original. Sin esto, el modo 14 disparaba un [O1-INTEGRITY-BREAK] FALSO cada vez
+  // (combine devolvia pt2 correctamente y lo comparabamos contra el original).
+  // Es seguro guardar un mem_t que apunte a Data: vive toda la llamada.
+  mem_t expected_pt = plaintext;
+
   switch (mode & 0x3F) { // 64 modos
     // ================================================================
     // MODO 0: BASE — reemplazar partial[2] con bytes del fuzzer
@@ -836,6 +844,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       combine_ciphertext_buf = ct2;
       combine_ciphertext = to_mem(combine_ciphertext_buf);
       combine_label = label; // label original con ciphertext ajeno
+      // ct2 y pd2 son CONSISTENTES entre si, asi que si combine tiene exito lo
+      // correcto es que devuelva pt2. Lo unico raro de este modo es la label
+      // cruzada, y eso lo mira el oraculo de label-binding, no el de integridad.
+      expected_pt = pt2;
       for (int i = 0; i < 3; i++)
         combine_partials.push_back(pd2[i]);
       break;
@@ -853,13 +865,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       error_t rvb = coinbase::api::tdh2::partial_decrypt(
           to_mem(g_private_shares[0]), to_mem(ciphertext), label, pd_b);
 
-      if (rva == SUCCESS && rvb == SUCCESS && !(pd_a == pd_b)) {
+      // ORACULO RETIRADO (era falso Y al reves).
+      // partial_decrypt produce una prueba ZK de descifrado correcto, y eso EXIGE
+      // aleatoriedad fresca: dos llamadas dan pruebas distintas pero ambas validas.
+      // Lo alarmante seria lo contrario -> dos salidas IDENTICAS significarian nonce
+      // determinista (reutilizacion de nonce), que es el bug de verdad. Este oraculo
+      // gritaba CRITICAL justo por la conducta segura: 4 falsos positivos medidos.
+      // Solo dejamos el caso peligroso, sin abortar (hace falta confirmar a mano que
+      // no venga de que el RNG del fuzzer quedo en el mismo estado).
+      if (rva == SUCCESS && rvb == SUCCESS && pd_a == pd_b) {
         std::fprintf(stderr,
-          "\n\n========================================\n"
-          "CRITICAL [O16-NON-DETERMINISTIC] partial_decrypt no es determinista\n"
-          "para la misma (private_share, ciphertext, label)\n"
-          "========================================\n\n");
-        std::abort();
+          "REVISAR [O16-DETERMINISTIC] partial_decrypt dio salida IDENTICA dos veces "
+          "(posible nonce determinista; confirmar que no sea el RNG del harness)\n");
       }
 
       for (int i = 0; i < 3; i++)
@@ -999,13 +1016,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
 
   // [O1] INTEGRITY-BREAK: combine SUCCESS pero plaintext != original
   if (combine_rv == SUCCESS) {
-    bool same_plaintext = (plaintext_out.size() == (int)pt_actual &&
-                           std::memcmp(plaintext_out.data(), plaintext.data,
-                                       pt_actual) == 0);
+    const size_t exp_len = (size_t)expected_pt.size;
+    bool same_plaintext = (plaintext_out.size() == (int)exp_len &&
+                           (exp_len == 0 ||
+                            std::memcmp(plaintext_out.data(), expected_pt.data,
+                                        exp_len) == 0));
 
     if (!same_plaintext) {
       // Check if plaintext_out is empty
-      if (plaintext_out.size() == 0 && pt_actual > 0) {
+      if (plaintext_out.size() == 0 && exp_len > 0) {
         std::fprintf(stderr,
           "\n\n========================================\n"
           "CRITICAL [O8-EMPTY-OUTPUT] combine SUCCESS devolvió\n"
@@ -1017,7 +1036,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       }
 
       // Check for length oracle
-      if (plaintext_out.size() != (int)pt_actual) {
+      if (plaintext_out.size() != (int)exp_len) {
         std::fprintf(stderr,
           "\n\n========================================\n"
           "MEDIUM [O9-LENGTH-LEAK] combine SUCCESS pero\n"
@@ -1031,11 +1050,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       // Check if plaintext is a prefix/suffix/related to original
       bool is_prefix = false;
       bool is_suffix = false;
-      if (plaintext_out.size() > 0 && pt_actual > 0) {
-        size_t min_len = std::min((size_t)plaintext_out.size(), pt_actual);
-        is_prefix = (std::memcmp(plaintext_out.data(), plaintext.data, min_len) == 0);
+      if (plaintext_out.size() > 0 && exp_len > 0) {
+        size_t min_len = std::min((size_t)plaintext_out.size(), exp_len);
+        is_prefix = (std::memcmp(plaintext_out.data(), expected_pt.data, min_len) == 0);
         is_suffix = (std::memcmp(plaintext_out.data() + plaintext_out.size() - min_len,
-                                 plaintext.data + pt_actual - min_len, min_len) == 0);
+                                 expected_pt.data + exp_len - min_len, min_len) == 0);
       }
 
       if (is_prefix || is_suffix) {
