@@ -77,7 +77,14 @@ inline void seed(const uint8_t* d, size_t n) {
   for (size_t i = 0; i < n; i++) { s[i & 3] ^= (uint64_t)d[i] << ((i % 8) * 8); next(); }
   for (int i = 0; i < 16; i++) next();  // warm-up
 }
+// Mismo bug que en fuzz_schnorr_party.cpp: s[4] es global y run_2pc corre P1 y P2
+// en dos hilos que llaman next() concurrentemente via RAND_bytes. Sin lock, el
+// estado se corrompe y una prueba ZK generada a medias es rechazada por la otra
+// parte -> el protocolo aborta antes de completar. Se arregla aca tambien porque
+// el codigo es identico y el riesgo es el mismo.
+inline std::mutex rng_mtx;
 inline int det_bytes(unsigned char* buf, int num) {
+  std::lock_guard<std::mutex> lk(rng_mtx);
   int i = 0;
   while (i < num) { uint64_t x = next(); int c = (num - i) < 8 ? (num - i) : 8; std::memcpy(buf + i, &x, c); i += c; }
   return 1;

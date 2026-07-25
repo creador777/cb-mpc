@@ -77,7 +77,21 @@ inline void seed(const uint8_t* d, size_t n) {
   for (size_t i = 0; i < n; i++) { s[i & 3] ^= (uint64_t)d[i] << ((i % 8) * 8); next(); }
   for (int i = 0; i < 16; i++) next();  // warm-up
 }
+// CARRERA DE DATOS: s[4] es estado global mutable y run_2pc corre P1 y P2 en DOS
+// HILOS que llaman next() a la vez (via RAND_bytes de OpenSSL, redirigido aca).
+// Sin lock, dos hilos pueden leer/escribir s[] entremedio y devolver valores rotos.
+//
+// Por que importa mas de lo que parece: P2 genera una prueba ZK usando esta
+// aleatoriedad. Si el estado se corrompe A MITAD de esa prueba, la prueba queda
+// internamente inconsistente y P1 la rechaza en zk_dl2.verify() -> sign() retorna
+// error ANTES de armar la firma. Encaja con lo medido el 2026-07-25: sign()
+// devolvio SUCCESS 0 veces en 128 ejecuciones, incluso con P2 honesto.
+//
+// El lock va en det_bytes (el punto de entrada desde OpenSSL) para que el llenado
+// de un buffer completo sea atomico, no solo cada next() suelto.
+inline std::mutex rng_mtx;
 inline int det_bytes(unsigned char* buf, int num) {
+  std::lock_guard<std::mutex> lk(rng_mtx);
   int i = 0;
   while (i < num) { uint64_t x = next(); int c = (num - i) < 8 ? (num - i) : 8; std::memcpy(buf + i, &x, c); i += c; }
   return 1;
