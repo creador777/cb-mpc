@@ -574,6 +574,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   // Es seguro guardar un mem_t que apunte a Data: vive toda la llamada.
   mem_t expected_pt = plaintext;
 
+  // ---- FILTRO DE PREMISAS ----------------------------------------------------
+  // Cada modo arma un escenario "malicioso" (un partial forjado, un ciphertext
+  // mutado, una label distinta...). Pero los bytes salen del fuzzer, asi que el
+  // escenario puede terminar siendo INOFENSIVO: el partial forjado sale igual al
+  // real, la mutacion XOR con 0 no cambia nada, la label "distinta" sale identica.
+  // En esos casos que la libreria acepte es CORRECTO, y gritar CRITICAL es mentir.
+  //
+  // Esto no es teorico: 6 alarmas de ALTO VALOR en un dia, todas por esta causa.
+  // Y no son raras — libFuzzer va guiado por cobertura, asi que BUSCA el input que
+  // provoca el abort: converge al falso positivo y suena sin parar.
+  //
+  // Regla: el modo DECLARA si su escenario es de verdad malicioso; ningun oraculo
+  // puede abortar sin eso. Si la premisa no se cumple es un bug del harness, se
+  // registra como HARNESS-BUG (no despierta a nadie) y se sigue fuzzeando.
+  bool escenario_malicioso = true;
+
   switch (mode & 0x3F) { // 64 modos
     // ================================================================
     // MODO 0: BASE — reemplazar partial[2] con bytes del fuzzer
@@ -617,6 +633,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       // La vista tiene que salir del buffer que SI persiste: combine_ciphertext_buf.
       combine_ciphertext_buf = ciphertext2;
       combine_ciphertext = to_mem(combine_ciphertext_buf);
+      // PREMISA: C2 tiene que ser realmente OTRO ciphertext. Si saliera igual a C1,
+      // combinar con los partials de C1 seria lo normal y no habria nada que reportar.
+      escenario_malicioso = !same_mem(to_mem(ciphertext), combine_ciphertext);
       for (int i = 0; i < 3; i++)
         combine_partials.push_back(partials[i]);
       break;
@@ -626,8 +645,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
     // MODO 3: PARTIAL-FORGERY — partial completamente sintético
     // ================================================================
     case 3: {
+      buf_t orig2 = partials[2];       // guardar el real ANTES de pisarlo
       mem_t evil = consume_bytes(512); // large evil partial
       partials[2] = buf_t(evil);
+      // PREMISA: el partial "forjado" tiene que diferir del legitimo. Si consume_bytes
+      // devolviera los mismos bytes (o el input ya se agoto), no hay forja: que combine
+      // acepte seria correcto y O5-PARTIAL-FORGERY estaria mintiendo.
+      escenario_malicioso = !same_mem(to_mem(partials[2]), to_mem(orig2));
       // Also poison the serialization structure
       if (partials[2].size() >= 12) {
         mutate_serialization_header(partials[2].data(), partials[2].size(),
@@ -642,6 +666,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
     // MODO 4: MALLEABILITY — ciphertext levemente mutado
     // ================================================================
     case 4: {
+      // PREMISA: hay que comprobar que la mutacion REALMENTE cambie el ciphertext.
+      // El XOR de abajo usa mut_sel, que puede valer 0 en los bytes tocados -> el
+      // ciphertext queda intacto y todo lo que siga es comportamiento legitimo.
+      buf_t ct_antes = ciphertext;
       if (ciphertext.size() > 0) {
         uint8_t* ct_data = ciphertext.data();
         size_t ct_sz = ciphertext.size();
@@ -655,6 +683,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
         }
         combine_ciphertext = to_mem(ciphertext);
       }
+      escenario_malicioso = !same_mem(to_mem(ct_antes), to_mem(ciphertext));
       for (int i = 0; i < 3; i++)
         combine_partials.push_back(partials[i]);
       break;
@@ -1032,7 +1061,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
                             std::memcmp(plaintext_out.data(), expected_pt.data,
                                         exp_len) == 0));
 
-    if (!same_plaintext) {
+    // Si el modo no logro armar un escenario malicioso de verdad (mutacion nula,
+    // partial identico al real, ciphertext sin cambiar...), un plaintext distinto
+    // no prueba nada roto: es el harness el que fallo en atacar. Se registra y sigue.
+    if (!same_plaintext && !escenario_malicioso) {
+      std::fprintf(stderr,
+        "HARNESS-BUG [premisa] mode=0x%02x: el escenario no resulto malicioso "
+        "(el ataque no cambio nada), asi que el plaintext distinto NO es un hallazgo\n",
+        mode);
+    } else if (!same_plaintext) {
       // Check if plaintext_out is empty
       if (plaintext_out.size() == 0 && exp_len > 0) {
         std::fprintf(stderr,
@@ -1093,7 +1130,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
     }
 
     // [O7] VERIFY-BYPASS: combine SUCCESS pero verify dio FAIL antes
-    if (ver_rv != SUCCESS && mode == 10) {
+    if (ver_rv != SUCCESS && (mode & 0x3F) == 10 && escenario_malicioso) {
       std::fprintf(stderr,
         "\n\n========================================\n"
         "CRITICAL [O7-VERIFY-BYPASS] verify rechazó el ciphertext\n"
@@ -1104,7 +1141,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
     }
 
     // [O5] PARTIAL-FORGERY: modo 3 (partial sintético) y combine SUCCESS
-    if (mode == 3) {
+    // escenario_malicioso = el partial forjado DIFIERE del real (si no, no hay forja)
+    if ((mode & 0x3F) == 3 && escenario_malicioso) {
       std::fprintf(stderr,
         "\n\n========================================\n"
         "CRITICAL [O5-PARTIAL-FORGERY] combine_additive ACEPTÓ\n"
@@ -1115,7 +1153,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
     }
 
     // [O11] QUORUM-BREAK: combine con menos de n partials
-    if (mode == 5) {
+    // PREMISA explicita: que de verdad haya MENOS partials de los necesarios.
+    // Sin esto, gritaba por el solo hecho de estar en el modo 5.
+    if ((mode & 0x3F) == 5 && combine_partials.size() < 3) {
       std::fprintf(stderr,
         "\n\n========================================\n"
         "CRITICAL [O11-QUORUM-BREAK] combine_additive ACEPTÓ\n"
@@ -1149,7 +1189,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   }
 
   // [O4] CROSS-CIPHERTEXT: modo 2
-  if (combine_rv == SUCCESS && mode == 2) {
+  if (combine_rv == SUCCESS && (mode & 0x3F) == 2 && escenario_malicioso) {
     std::fprintf(stderr,
       "\n\n========================================\n"
       "CRITICAL [O4-CROSS-CIPHERTEXT] combine ACEPTÓ\n"
