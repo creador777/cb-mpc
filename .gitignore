@@ -107,3 +107,10 @@ fuzz/*crash-*
 fuzz/*CRASH*
 fuzz/HALLAZGO*
 fuzz/ESTADO-Y-PROXIMOS-PASOS.md
+fuzz/*_d2
+fuzz/*_diag
+fuzz/*_mutant
+fuzz/corpus_mut/
+fuzz/corpus_d2/
+fuzz/corpus_diag/
+fuzz/.cuarentena_*
