@@ -67,3 +67,27 @@ tmp/
 problems/
 .zencoder/
 *.pdf
+
+# ---- Fuzzing: NUNCA publicar en un repo publico ----
+# Un artefacto de crash es un PoC de vulnerabilidad: subirlo = divulgacion publica
+# antes de reportar. Tambien excluimos binarios y corpus (ruido pesado).
+fuzz/hit_*
+fuzz/crash-*
+fuzz/leak-*
+fuzz/oom-*
+fuzz/timeout-*
+fuzz/slow-unit-*
+fuzz/sl_*
+fuzz/diag_*
+fuzz/tdh2diag_*
+fuzz/*.log
+fuzz/.covstate_*
+fuzz/corpus*/
+fuzz/fuzz_malicious
+fuzz/fuzz_malicious_mp
+fuzz/fuzz_schnorr
+fuzz/fuzz_tdh2
+fuzz/fuzz_pve
+fuzz/fuzz_failed_sign
+fuzz/fuzzer/
+fuzz/smoke_*

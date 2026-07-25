@@ -516,6 +516,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   mem_t label = consume_bytes(label_len);
   mem_t plaintext = consume_bytes(pt_len);
 
+  // OJO: consume_bytes RECORTA a los bytes que quedan, asi que el largo real puede
+  // ser < pt_len. Comparar contra pt_len (el largo PEDIDO) causaba dos bugs graves:
+  //  1) heap-buffer-overflow al memcmp pt_len bytes sobre un buffer mas chico (ASan);
+  //  2) FALSO "CRITICAL [O1-INTEGRITY-BREAK]": se cifra el plaintext recortado, el
+  //     descifrado devuelve ese mismo largo, pero se comparaba contra pt_len -> los
+  //     tamanos no coincidian y un roundtrip CORRECTO se reportaba como rotura.
+  // Regla: para toda comparacion usar el largo REAL, no el pedido.
+  const size_t pt_actual = (size_t)plaintext.size;
+
   // ---- STEP 1: Encrypt (honesto) ----
   buf_t ciphertext;
   error_t enc_rv = coinbase::api::tdh2::encrypt(
@@ -584,8 +593,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       if (enc2_rv != SUCCESS) return 0;
 
       // Use partials from C1 but ciphertext = C2
+      // OJO: mem_t es una VISTA sin dueno. ciphertext2 es local al case y muere en el
+      // break de abajo, asi que to_mem(ciphertext2) quedaba colgando y se usaba ~400
+      // lineas mas abajo en combine_additive (heap-use-after-free real, visto con ASan).
+      // La vista tiene que salir del buffer que SI persiste: combine_ciphertext_buf.
       combine_ciphertext_buf = ciphertext2;
-      combine_ciphertext = to_mem(ciphertext2);
+      combine_ciphertext = to_mem(combine_ciphertext_buf);
       for (int i = 0; i < 3; i++)
         combine_partials.push_back(partials[i]);
       break;
@@ -818,8 +831,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       }
 
       // Mezclar: ciphertext de ct2, label original, partials de ct2
+      // Mismo caso que el MODO 2: ct2 es local al case y muere en el break -> la vista
+      // debe apuntar al buffer persistente, no al local (heap-use-after-free).
       combine_ciphertext_buf = ct2;
-      combine_ciphertext = to_mem(ct2);
+      combine_ciphertext = to_mem(combine_ciphertext_buf);
       combine_label = label; // label original con ciphertext ajeno
       for (int i = 0; i < 3; i++)
         combine_partials.push_back(pd2[i]);
@@ -984,13 +999,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
 
   // [O1] INTEGRITY-BREAK: combine SUCCESS pero plaintext != original
   if (combine_rv == SUCCESS) {
-    bool same_plaintext = (plaintext_out.size() == (int)pt_len &&
+    bool same_plaintext = (plaintext_out.size() == (int)pt_actual &&
                            std::memcmp(plaintext_out.data(), plaintext.data,
-                                       pt_len) == 0);
+                                       pt_actual) == 0);
 
     if (!same_plaintext) {
       // Check if plaintext_out is empty
-      if (plaintext_out.size() == 0 && pt_len > 0) {
+      if (plaintext_out.size() == 0 && pt_actual > 0) {
         std::fprintf(stderr,
           "\n\n========================================\n"
           "CRITICAL [O8-EMPTY-OUTPUT] combine SUCCESS devolvió\n"
@@ -1002,25 +1017,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       }
 
       // Check for length oracle
-      if (plaintext_out.size() != (int)pt_len) {
+      if (plaintext_out.size() != (int)pt_actual) {
         std::fprintf(stderr,
           "\n\n========================================\n"
           "MEDIUM [O9-LENGTH-LEAK] combine SUCCESS pero\n"
           "plaintext de largo distinto: original=%zu bytes, out=%d bytes\n"
           "  mode=0x%02x  mut_sel=0x%04x\n"
           "========================================\n\n",
-          pt_len, (int)plaintext_out.size(), mode, mut_sel);
+          pt_actual, (int)plaintext_out.size(), mode, mut_sel);
         // No abort: es Medium, pero lo logueamos
       }
 
       // Check if plaintext is a prefix/suffix/related to original
       bool is_prefix = false;
       bool is_suffix = false;
-      if (plaintext_out.size() > 0 && pt_len > 0) {
-        size_t min_len = std::min((size_t)plaintext_out.size(), pt_len);
+      if (plaintext_out.size() > 0 && pt_actual > 0) {
+        size_t min_len = std::min((size_t)plaintext_out.size(), pt_actual);
         is_prefix = (std::memcmp(plaintext_out.data(), plaintext.data, min_len) == 0);
         is_suffix = (std::memcmp(plaintext_out.data() + plaintext_out.size() - min_len,
-                                 plaintext.data + pt_len - min_len, min_len) == 0);
+                                 plaintext.data + pt_actual - min_len, min_len) == 0);
       }
 
       if (is_prefix || is_suffix) {
@@ -1044,7 +1059,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
         "  mode=0x%02x  mut_sel=0x%04x\n"
         "  label_len=%zu\n"
         "========================================\n\n",
-        pt_len, (int)plaintext_out.size(), mode, mut_sel, label_len);
+        pt_actual, (int)plaintext_out.size(), mode, mut_sel, label_len);
       std::abort();
     }
 
@@ -1139,7 +1154,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
 // ============================================================================
 extern "C" size_t LLVMFuzzerCustomMutator(uint8_t* Data, size_t Size,
                                           size_t MaxSize, unsigned int Seed) {
-  if (Size == 0) return 0;
+  if (MaxSize == 0) return 0;
 
   // Use Seed to drive deterministic mutation decisions
   uint64_t rng = (uint64_t)Seed * 0x9E3779B97F4A7C15ULL;
@@ -1152,6 +1167,21 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t* Data, size_t Size,
 
   size_t new_size = Size;
   if (new_size > MaxSize) new_size = MaxSize;
+
+  // ---- [ARRANQUE EN FRIO] ----------------------------------------------------
+  // BUG que esto arregla (medido: 24h en la nube con cobertura 0):
+  // con el corpus vacio libFuzzer entrega 1 byte. El bucle de abajo corta en
+  // "if (new_size < 4) break;" y las unicas acciones que CRECEN la entrada (case 4)
+  // estan DENTRO de ese bucle -> la entrada se quedaba clavada en 1 byte para
+  // siempre. Y LLVMFuzzerTestOneInput exige Size>=16, asi que TODO se rechazaba:
+  // sin cobertura no hay corpus, y sin corpus las entradas nunca crecen. Candado.
+  // Solucion: si la entrada no llega al minimo util, la inflamos aca (libFuzzer
+  // permite escribir hasta MaxSize en Data). 128 = header(16) + label(<=32) + pt.
+  const size_t kMinUseful = 128;
+  if (new_size < kMinUseful) {
+    const size_t target = (MaxSize < kMinUseful) ? MaxSize : kMinUseful;
+    while (new_size < target) Data[new_size++] = rng_next();
+  }
 
   // Number of mutation passes
   int passes = 1 + (rng_next() % 5);

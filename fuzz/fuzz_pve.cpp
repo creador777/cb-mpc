@@ -216,16 +216,32 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       }
       break;
     }
-    // [F] MALLEABILITY: ct mutado 1 byte no debe descifrar al plaintext original
+    // [F] MALLEABILITY: un ct mutado que SIGUE pasando verify y ademas descifra al
+    //     mismo plaintext => la prueba no ata todo el ciphertext (maleabilidad real).
+    //
+    //     CLAVE: exigir verify()==SUCCESS antes de mirar decrypt. Sin ese guard el
+    //     oraculo es puro ruido: decrypt NO valida las partes de prueba (eso lo hace
+    //     verify), asi que mutar un byte de la prueba y que decrypt siga devolviendo x
+    //     es comportamiento ESPERADO, no un bug. Y en PVE nunca se descifra un ct que
+    //     no paso verify -> fuera del modelo de amenaza.
+    //     Medido: sin el guard, este oraculo disparaba ~850 CRITICAL falsos por minuto
+    //     (input de 2 bytes bastaba) -> habria inundado la alerta y tapado un hit real.
     default: {
-      if (g_ct.size() == 0) break;
+      if (g_ct.size() == 0 || blob.size() < 2) break;
+      const uint8_t mask = blob[1];
+      if (mask == 0) break;                      // XOR con 0 no muta nada
       buf_t mct(g_ct);
-      size_t off = blob.empty() ? 0 : (blob[0] % (size_t)mct.size());
-      mct[off] ^= (blob.size() > 1 ? blob[1] : 0xFF);
+      const size_t off = blob[0] % (size_t)mct.size();
+      mct[off] ^= mask;
+      mem_t mctm = M(mct.data(), mct.size());
+      mem_t Qref = M(g_Q.data(), g_Q.size());
+      // rechazado por verify -> correcto, no hay nada que reportar
+      if (pve::verify(kCurve, g_ek, mctm, Qref, label) != SUCCESS) break;
       buf_t x2;
-      if (pve::decrypt(kCurve, g_dk, g_ek, M(mct.data(), mct.size()), label, x2) == SUCCESS &&
+      if (pve::decrypt(kCurve, g_dk, g_ek, mctm, label, x2) == SUCCESS &&
           x2.size() == g_x.size() && std::memcmp(x2.data(), g_x.data(), g_x.size()) == 0) {
-        std::fprintf(stderr, "CRITICAL [PVE-MALLEABILITY] ct mutado descifro al plaintext original!\n");
+        std::fprintf(stderr,
+                     "CRITICAL [PVE-MALLEABILITY] ct mutado PASA verify y descifra al plaintext original!\n");
         std::abort();
       }
       break;
