@@ -484,6 +484,16 @@ extern "C" int LLVMFuzzerInitialize(int* argc, char*** argv) {
 // ============================================================================
 // LLVMFuzzerTestOneInput: el loop de fuzz
 // ============================================================================
+// Dos mem_t con el MISMO contenido? Los oraculos de label-binding lo necesitan:
+// "verify acepta con otra label" solo es un bug si la label es REALMENTE otra.
+// Ojo con data[0] en buffers vacios (lectura fuera de rango): por eso se compara
+// el tamano primero y se trata el caso size==0 aparte.
+static bool same_mem(mem_t a, mem_t b) {
+  if (a.size != b.size) return false;
+  if (a.size == 0) return true;
+  return std::memcmp(a.data, b.data, (size_t)a.size) == 0;
+}
+
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   if (!g_bootstrapped || Size < 16) return 0;
 
@@ -893,9 +903,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
           to_mem(g_public_key), to_mem(ciphertext), evil_label);
 
       // Si verify con label incorrecta pasa → bug (label binding)
-      if (vrv == SUCCESS && !(label.data[0] == evil_label.data[0] &&
-           label.size == evil_label.size &&
-           std::memcmp(label.data, evil_label.data, label.size) == 0)) {
+      // antes hacia label.data[0] sin mirar el tamano -> lectura fuera de rango con
+      // labels vacias. same_mem compara tamano primero y trata size==0 aparte.
+      if (vrv == SUCCESS && !same_mem(label, evil_label)) {
         std::fprintf(stderr,
           "\n\n========================================\n"
           "CRITICAL [O3-LABEL-CONFUSION-VERIFY] verify ACEPTA ciphertext\n"
@@ -1118,9 +1128,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   }
 
   // [O3] LABEL-CONFUSION: modo 1 y combine SUCCESS
-  if (combine_rv == SUCCESS && mode == 1) {
-    // Already handled by O1 (plaintext won't match original),
-    // but also check verify here
+  // El switch usa (mode & 0x3F), asi que comparar "mode == 1" dejaba fuera 65/129/193.
+  // Y CLAVE: el modo 1 arma la "evil_label" con consume_bytes, que puede devolver
+  // exactamente los MISMOS bytes que la label original (o dos vacias si el offset se
+  // agoto). Sin el guard same_mem, que verify aceptara era CORRECTO y aun asi gritaba
+  // CRITICAL. Peor: el fuzzer va guiado por cobertura, asi que BUSCA ese input para
+  // provocar el abort -> converge al falso positivo y suena sin parar.
+  if (combine_rv == SUCCESS && (mode & 0x3F) == 1 && !same_mem(combine_label, label)) {
     error_t vrv = coinbase::api::tdh2::verify(
         to_mem(g_public_key), to_mem(ciphertext), combine_label);
     if (vrv == SUCCESS) {
