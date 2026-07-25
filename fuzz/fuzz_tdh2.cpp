@@ -590,6 +590,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   // registra como HARNESS-BUG (no despierta a nadie) y se sigue fuzzeando.
   bool escenario_malicioso = true;
 
+  // Resultado de verify() sobre el ciphertext YA ATACADO. Tiene que vivir a nivel de
+  // funcion: el modo 10 lo calculaba en una variable local que moria en el break, y el
+  // oraculo O7 terminaba consultando ver_rv, que es el verify del ciphertext HONESTO y
+  // por tanto casi siempre SUCCESS -> O7 no podia disparar NUNCA (oraculo muerto).
+  // SUCCESS por defecto = "no se ataco el ciphertext", que no dispara nada.
+  error_t ver_rv_atacado = SUCCESS;
+
   switch (mode & 0x3F) { // 64 modos
     // ================================================================
     // MODO 0: BASE — reemplazar partial[2] con bytes del fuzzer
@@ -759,25 +766,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
     // MODO 10: VERIFY vs COMBINE — verificar ciphertext mutado
     // ================================================================
     case 10: {
+      buf_t ct_orig_m10 = ciphertext;   // copia para comprobar que la mutacion muto
       // Mutar ciphertext
       if (ciphertext.size() > 0) {
         uint8_t* ct = ciphertext.data();
         for (size_t i = 0; i < ciphertext.size() && i < 8; i++)
           ct[i] ^= (uint8_t)(fuzzrng::next() & 0xFF);
       }
-      // Verify
-      error_t vrv = coinbase::api::tdh2::verify(
+      // Verify sobre el ciphertext YA MUTADO. El resultado va a la variable de
+      // funcion: si se quedara local, el oraculo O7 no lo ve (era el bug).
+      ver_rv_atacado = coinbase::api::tdh2::verify(
           to_mem(g_public_key), to_mem(ciphertext), label);
 
       for (int i = 0; i < 3; i++)
         combine_partials.push_back(partials[i]);
       combine_ciphertext = to_mem(ciphertext);
-
-      // [O7] Si verify rechaza explícitamente, logueamos (no abort aún,
-      // pero si combine luego tiene SUCCESS, es un bug)
-      if (vrv != SUCCESS) {
-        // Marcar para oráculo [O7]
-      }
+      // PREMISA: solo cuenta como ataque si la mutacion cambio el ciphertext.
+      escenario_malicioso = !same_mem(to_mem(ct_orig_m10), to_mem(ciphertext));
       break;
     }
 
@@ -1130,7 +1135,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
     }
 
     // [O7] VERIFY-BYPASS: combine SUCCESS pero verify dio FAIL antes
-    if (ver_rv != SUCCESS && (mode & 0x3F) == 10 && escenario_malicioso) {
+    if (ver_rv_atacado != SUCCESS && (mode & 0x3F) == 10 && escenario_malicioso) {
       std::fprintf(stderr,
         "\n\n========================================\n"
         "CRITICAL [O7-VERIFY-BYPASS] verify rechazó el ciphertext\n"

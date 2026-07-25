@@ -150,7 +150,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       mem_t Qref = M(g_Q.data(), g_Q.size());
       if (pve::verify(kCurve, g_ek, ct, Qref, label) == SUCCESS) {
         buf_t x2;
-        if (pve::decrypt(kCurve, g_dk, g_ek, ct, label, x2) == SUCCESS && x2.size() > 0) {
+        // Sin el guard "x2.size() > 0": el contrato de decrypt dice que en exito
+        // devuelve x con el largo del orden de la curva (32B), nunca 0. Si alguna vez
+        // devolviera SUCCESS con largo 0 eso YA seria el hallazgo, y el guard lo hacia
+        // saltar en silencio. scalar_to_Q maneja bien el caso (devuelve false) y el
+        // CRITICAL dispara solo.
+        if (pve::decrypt(kCurve, g_dk, g_ek, ct, label, x2) == SUCCESS) {
           std::array<uint8_t, 33> q2{};
           if (!scalar_to_Q(x2.data(), x2.size(), q2) || q2 != g_Q) {
             std::fprintf(stderr, "CRITICAL [PVE-BINDING] verify ACEPTA pero decrypt no corresponde a Q!\n");

@@ -201,22 +201,39 @@ static bool extract_s_is_high(const buf_t& sig_der) {
 class nonce_oracle_t {
  public:
   void check_and_record(const std::array<uint8_t, 32>& r, const std::array<uint8_t, 32>& h) {
-    // [OBJ-3] R = infinito (todo ceros) jamás debe ocurrir
-    std::array<uint8_t, 32> zero{};
-    if (r == zero) {
-      std::fprintf(stderr, "CRITICAL [R-INFINITY] firma con R = punto al infinito\n");
-      std::abort();
-    }
+    // El chequeo de r==0 vivia aca y era CODIGO MUERTO: extract_r32() descarta las
+    // firmas con r==0 (BN_is_zero) y solo llama a esta funcion si devolvio true, asi
+    // que nunca podia entrar con r en cero. Ahora se comprueba en sig_r_is_zero(),
+    // ANTES de ossl_verify, que es donde el dato todavia existe.
+    std::lock_guard<std::mutex> lk(mtx_);
     auto it = map_.find(r);
-    if (it == map_.end()) { map_.emplace(r, h); return; }
+    if (it == map_.end()) { if (map_.size() < kCap) map_.emplace(r, h); return; }
     if (it->second != h) {
       std::fprintf(stderr, "CRITICAL [NONCE-REUSE] mismo R para dos hashes distintos: clave privada extraíble\n");
       std::abort();
     }
   }
  private:
+  static constexpr size_t kCap = 200000;  // ~12MB tope; evita OOM en corridas largas
+  std::mutex mtx_;
   std::map<std::array<uint8_t, 32>, std::array<uint8_t, 32>> map_;
 };
+
+// r == 0 en una firma que cb-mpc dio por buena. Se mira ANTES de ossl_verify: si
+// esperamos a OpenSSL, este rechaza r==0 por su cuenta y el caso nunca se ve.
+// Que la libreria PRODUZCA una firma degenerada es el hallazgo, aunque un
+// verificador externo despues la rechace.
+static bool sig_r_is_zero(const buf_t& sig_der) {
+  if (sig_der.size() == 0) return false;
+  const unsigned char* sp = reinterpret_cast<const unsigned char*>(sig_der.data());
+  ECDSA_SIG* sig = d2i_ECDSA_SIG(nullptr, &sp, (long)sig_der.size());
+  if (!sig) return false;
+  const BIGNUM *r = nullptr, *s = nullptr;
+  ECDSA_SIG_get0(sig, &r, &s);
+  bool zero = (r != nullptr) && BN_is_zero(r);
+  ECDSA_SIG_free(sig);
+  return zero;
+}
 
 // ============================================================================
 // Oráculo de leak: el escalar privado NUNCA debe aparecer literal en el
@@ -667,6 +684,15 @@ static void run_3pc(const std::shared_ptr<network_t>& net, F1&& f1, F2&& f2, F3&
 // Estado global: clave de referencia (DKG LIMPIO una sola vez, persistida).
 // ============================================================================
 static buf_t g_key1, g_key2, g_pub;
+
+// GLOBAL, no local a LLVMFuzzerTestOneInput. Estaba declarado dentro de la funcion,
+// asi que el mapa nacia VACIO y moria en CADA ejecucion: solo podia detectar reuso de
+// nonce entre las <=8 firmas de un mismo input, nunca a lo largo de la campana (millones
+// de ejecuciones). El reuso de nonce en ECDSA permite EXTRAER la clave privada — es el
+// oraculo de mas valor del harness y estaba castrado. El harness hermano de Schnorr ya
+// lo tenia global ("global entre inputs"): el patron correcto existia y no se aplico aca.
+// Lleva mutex y tope de memoria porque ahora vive toda la campana.
+static nonce_oracle_t g_nonce;
 static bool g_ready = false;
 
 #ifdef FUZZ_ECDSA_MP
@@ -818,7 +844,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
   coinbase::api::job_2p_t j1{coinbase::api::party_2p_t::p1, p1, p2, t_h};
   coinbase::api::job_2p_t j2{coinbase::api::party_2p_t::p2, p1, p2, t_m};
 
-  nonce_oracle_t nonce;
   size_t hcur = 0;
 
   for (uint8_t op : ops) {
@@ -832,12 +857,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
               [&] { return e2::sign(j2, g_key2, mh, sid2, sig2); }, r1, r2);
       if (r1 == SUCCESS && sig1.size() > 0) {
         mem_t hv{mh.data(), mh.size()};
+        if (sig_r_is_zero(sig1)) {
+          std::fprintf(stderr, "CRITICAL [R-ZERO] 2P: SUCCESS con firma degenerada r=0\n");
+          std::abort();
+        }
         if (!ossl_verify(hv, g_pub, sig1)) {
           std::fprintf(stderr, "CRITICAL [SIGN-BREAK] P1 SUCCESS con firma que NO verifica bajo la clave real\n");
           std::abort();
         }
         std::array<uint8_t, 32> r{};
-        if (extract_r32(sig1, r)) nonce.check_and_record(r, h);
+        if (extract_r32(sig1, r)) g_nonce.check_and_record(r, h);
         // [OBJ-3] Check high-s (BIP-62 malleability, Medium tier)
         if (extract_s_is_high(sig1)) {
           std::fprintf(stderr, "MEDIUM [HIGH-S] firma con s > order/2 (malleable, BIP-62)\n");
@@ -893,12 +922,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* Data, size_t Size) {
       // Oráculo: P0 SUCCESS + firma → DEBE verificar bajo g_mp_pub
       if (mr0 == SUCCESS && msig0.size() > 0) {
         mem_t hv{mh.data(), mh.size()};
+        if (sig_r_is_zero(msig0)) {
+          std::fprintf(stderr, "CRITICAL [R-ZERO] MP: SUCCESS con firma degenerada r=0\n");
+          std::abort();
+        }
         if (!ossl_verify(hv, g_mp_pub, msig0)) {
           std::fprintf(stderr, "CRITICAL [MP-SIGN-BREAK] firma MP no verifica bajo clave real\n");
           std::abort();
         }
         std::array<uint8_t, 32> r{};
-        if (extract_r32(msig0, r)) nonce.check_and_record(r, h);
+        if (extract_r32(msig0, r)) g_nonce.check_and_record(r, h);
         if (extract_s_is_high(msig0)) {
           std::fprintf(stderr, "MEDIUM [MP-HIGH-S] firma MP con s > order/2\n");
         }

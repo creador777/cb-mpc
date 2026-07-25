@@ -80,9 +80,12 @@ fuzz/slow-unit-*
 fuzz/sl_*
 fuzz/diag_*
 fuzz/tdh2diag_*
+fuzz/uaf_*
 fuzz/*.log
 fuzz/.covstate_*
+fuzz/.pivotstate_*
 fuzz/corpus*/
+fuzz/falsos_positivos/
 fuzz/fuzz_malicious
 fuzz/fuzz_malicious_mp
 fuzz/fuzz_schnorr
@@ -91,3 +94,16 @@ fuzz/fuzz_pve
 fuzz/fuzz_failed_sign
 fuzz/fuzzer/
 fuzz/smoke_*
+
+# CUALQUIER poc_*/REPORTE-*/*crash* con CUALQUIER extension (no solo el binario
+# sin extension). El bug de ayer: "fuzz/poc_refresh_dos" (sin extension) bloqueaba
+# el binario pero NO "poc_refresh_dos.cpp" (el codigo fuente) -> se filtro al repo
+# publico un PoC de vulnerabilidad + su reporte completo con archivo:linea exacto.
+# Regla generica por PREFIJO, no por nombre exacto, para que esto no vuelva a pasar
+# con la proxima extension/herramienta que nadie previo.
+fuzz/poc_*
+fuzz/REPORTE-*
+fuzz/*crash-*
+fuzz/*CRASH*
+fuzz/HALLAZGO*
+fuzz/ESTADO-Y-PROXIMOS-PASOS.md
