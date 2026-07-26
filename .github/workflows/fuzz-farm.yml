@@ -134,8 +134,22 @@ jobs:
               "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" /tmp/pool 2>/dev/null || { echo "no pude clonar el pool"; break; }
             mkdir -p "/tmp/pool/${{ matrix.harness.bin }}"
             rsync -a --ignore-existing "fuzz/${{ matrix.harness.corpus }}/" "/tmp/pool/${{ matrix.harness.bin }}/"
-            # nunca subir crashes crudos al pool publico (solo inputs de corpus)
-            rm -f /tmp/pool/${{ matrix.harness.bin }}/hit_* /tmp/pool/${{ matrix.harness.bin }}/crash-* 2>/dev/null
+            # NUNCA subir crashes crudos al pool publico (solo inputs de corpus).
+            # Antes solo se borraban hit_* y crash-*: quedaban fuera sl_*, uaf_*,
+            # timeout-*, oom-*, leak-* y slow-unit-*, todos prefijos que producen
+            # nuestras herramientas. Un PoC sin reportar publicado en una rama
+            # publica quema el bounty, asi que la red se cierra por completo y se
+            # verifica DESPUES de limpiar, fallando el paso si algo sobrevivio.
+            P="/tmp/pool/${{ matrix.harness.bin }}"
+            rm -f "$P"/hit_* "$P"/crash-* "$P"/sl_* "$P"/uaf_* "$P"/diag_* \
+                  "$P"/timeout-* "$P"/oom-* "$P"/leak-* "$P"/slow-unit-* \
+                  "$P"/*crash* "$P"/*.log 2>/dev/null
+            SOBRA=$(find "$P" -maxdepth 1 \( -name '*crash*' -o -name 'hit_*' -o -name 'sl_*' \
+                    -o -name 'uaf_*' -o -name 'timeout-*' -o -name 'oom-*' -o -name 'leak-*' \) 2>/dev/null | wc -l)
+            if [ "$SOBRA" != "0" ]; then
+              echo "::error::ABORTO: $SOBRA artefacto(s) de crash iban al pool PUBLICO"
+              cd "$GITHUB_WORKSPACE"; break
+            fi
             cd /tmp/pool
             git config user.email "bot@fuzz"; git config user.name "cloud-${{ matrix.harness.bin }}-s${{ matrix.shard }}"
             git add -A
