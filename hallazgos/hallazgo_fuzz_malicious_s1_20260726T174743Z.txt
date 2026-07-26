@@ -1,0 +1,14 @@
+harness=fuzz_malicious
+shard=1
+run=30204668263
+fecha_utc=20260726T174743Z
+crashes=2
+timeouts=0
+alto_valor=0
+--- tipo de error (sin input crudo) ---
+==N==ERROR: AddressSanitizer: ABRT on unknown address 0xN (pc 0xN bp 0xN sp 0xN T542)
+==N==ERROR: AddressSanitizer: ABRT on unknown address 0xN (pc 0xN bp 0xN sp 0xN T606)
+--- sha256 de los inputs (para deduplicar; el input NO se sube) ---
+851e7441965bf4c0edd96374fddf15dcd5ce99f1e3fe41e8f5ad04d02c4dd350
+11194c917bf899b0af84c60ddb25417c2c18a270a5a93a7bc647e985c3787d68
+1a52ee33ca0d23a74ea2ec37af96c084a1241973e17a17c871d78f854e9b332b
