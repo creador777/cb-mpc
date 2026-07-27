@@ -55,6 +55,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Preflight de retencion cifrada
+        id: retention_preflight
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GPG_PUBLIC_KEY:-}" ]; then
+            echo "::error::GPG_PUBLIC_KEY ausente. NO RETENTION = NO HUNT."
+            exit 1
+          fi
+
+          GH="$(mktemp -d)"
+          PUB="$(mktemp)"
+          CANARY="$(mktemp)"
+          ENC="$(mktemp)"
+
+          cleanup() {
+            rm -rf "$GH" "$PUB" "$CANARY" "$ENC"
+          }
+          trap cleanup EXIT
+
+          chmod 700 "$GH"
+          printf '%s' "$GPG_PUBLIC_KEY" > "$PUB"
+
+          GNUPGHOME="$GH" \
+            gpg --batch --import "$PUB" >/dev/null 2>&1
+
+          FPR=$(
+            GNUPGHOME="$GH" \
+              gpg --batch --with-colons --list-keys |
+              awk -F: '$1=="fpr"{print $10; exit}'
+          )
+
+          if [ -z "$FPR" ]; then
+            echo "::error::La clave publica GPG no pudo importarse."
+            exit 1
+          fi
+
+          printf 'CBMPC-RETENTION-CANARY\n' > "$CANARY"
+
+          GNUPGHOME="$GH" \
+            gpg --batch --yes \
+              --trust-model always \
+              --recipient "$FPR" \
+              --output "$ENC" \
+              --encrypt "$CANARY"
+
+          test -s "$ENC" || {
+            echo "::error::El canary GPG no produjo ciphertext."
+            exit 1
+          }
+
+          echo "fingerprint=$FPR" >> "$GITHUB_OUTPUT"
+          echo "RETENTION_PREFLIGHT=PASS"
+
+
       - name: Instalar LLVM 20 + deps (igual que el Dockerfile)
         run: |
           set -euo pipefail
@@ -161,144 +216,492 @@ jobs:
           done
           true
 
-      - name: Clasificar (ALTO VALOR vs DoS is_in_range)
+      - name: Clasificar incidente y decidir captura
         id: classify
-        if: steps.fuzz.outputs.rc != '200'
-        run: |
-          cd fuzz
-          NEW=0
-          # Cualquier tag CRITICAL [..] cuenta como ALTO VALOR. Antes la lista era fija
-          # y dejaba MUDOS a los harnesses nuevos (TDH2 emite [O1-INTEGRITY-BREAK],
-          # [O5-PARTIAL-FORGERY]...; PVE emite [PVE-BINDING], [PVE-LEAK]...) -> un hallazgo
-          # real no alertaba. Regla generica: si un oraculo grita CRITICAL, avisamos.
-          if grep -aE 'CRITICAL \[[A-Za-z0-9_-]+\]' fuzz.log 2>/dev/null | grep -av 'is_in_range' >/dev/null 2>&1; then NEW=1; fi
-          if grep -aE 'SUMMARY: (AddressSanitizer|UndefinedBehaviorSanitizer|MemorySanitizer): (heap-buffer-overflow|heap-use-after-free|use-after-free|stack-buffer-overflow|global-buffer-overflow|double-free|stack-overflow|SEGV|out-of-bounds)' fuzz.log 2>/dev/null | grep -av 'is_in_range' >/dev/null 2>&1; then NEW=1; fi
-          echo "new=$NEW" >> "$GITHUB_OUTPUT"
-
-          # ---- CONTEO CRUDO DE CRASHES (independiente del filtro de alto valor) ----
-          # Sin esto, un crash que no matchea los patrones de arriba se PERDIA en
-          # silencio: el runner se destruye al terminar y el archivo se va con el.
-          # Medido 2026-07-25: varios jobs reportaron crash 1/2/3 y timeouts 14-16,
-          # y nada de eso llego nunca a Victor — el resumen decia "sin hits" y el
-          # panel local mostraba "crashes 0". Un hallazgo que no llega es un hallazgo
-          # perdido, y hasta un Low se cobra.
-          LAST=$(grep -aE '^#[0-9]+.*cov:' fuzz.log 2>/dev/null | tail -1)
-          NCRASH=$(printf '%s' "$LAST" | sed -nE 's#.*oom/timeout/crash: [0-9]+/[0-9]+/([0-9]+).*#\1#p'); NCRASH=${NCRASH:-0}
-          NTIMEOUT=$(printf '%s' "$LAST" | sed -nE 's#.*oom/timeout/crash: [0-9]+/([0-9]+)/[0-9]+.*#\1#p'); NTIMEOUT=${NTIMEOUT:-0}
-          NFILES=$(ls -1 hit_* 2>/dev/null | wc -l)
-          echo "ncrash=$NCRASH" >> "$GITHUB_OUTPUT"
-          echo "ntimeout=$NTIMEOUT" >> "$GITHUB_OUTPUT"
-          echo "nfiles=$NFILES" >> "$GITHUB_OUTPUT"
-          echo "La nube encontro: crashes=$NCRASH timeouts=$NTIMEOUT artefactos=$NFILES"
-
-          if [ "$NEW" = "1" ]; then echo "::warning::HIT ALTO VALOR en ${{ matrix.harness.bin }} shard ${{ matrix.shard }}."; else echo "sin hits de alto valor (solo DoS/ruido)"; fi
-
-      # ========================================================================
-      # CANAL NUBE -> LOCAL. Publica la FIRMA de todo crash/timeout en la rama
-      # corpus-pool (el mismo cerebro que ya comparten nube y local), para que el
-      # panel local lo vea y suene la alarma AUNQUE no sea "alto valor".
-      #
-      # SEGURIDAD: el repo es PUBLICO. NO se sube el input crudo del crash — eso
-      # seria divulgar un PoC antes de reportarlo. Se sube solo metadata: harness,
-      # shard, conteos, el tipo de error, y el SHA256 de cada input (sirve para
-      # deduplicar y para pedir la captura cifrada si hace falta).
-      # ========================================================================
-      - name: Publicar firma de hallazgos al pool (nube -> local)
-        if: always() && steps.fuzz.outputs.rc != '200' && (steps.classify.outputs.ncrash != '0' || steps.classify.outputs.ntimeout != '0' || steps.classify.outputs.new == '1')
+        if: always() && steps.fuzz.outputs.rc != '200'
         run: |
           set +e
           cd fuzz
-          STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-          SIG="hallazgo_${{ matrix.harness.bin }}_s${{ matrix.shard }}_${STAMP}.txt"
+
+          NEW=0
+
+          if grep -aE \
+            'CRITICAL \[[A-Za-z0-9_-]+\]' \
+            fuzz.log 2>/dev/null |
+            grep -av 'is_in_range' >/dev/null 2>&1
+          then
+            NEW=1
+          fi
+
+          if grep -aE \
+            'SUMMARY: (AddressSanitizer|UndefinedBehaviorSanitizer|MemorySanitizer): (heap-buffer-overflow|heap-use-after-free|use-after-free|stack-buffer-overflow|global-buffer-overflow|double-free|stack-overflow|SEGV|out-of-bounds)' \
+            fuzz.log 2>/dev/null |
+            grep -av 'is_in_range' >/dev/null 2>&1
+          then
+            NEW=1
+          fi
+
+          LAST=$(
+            grep -aE '^#[0-9]+.*cov:' \
+              fuzz.log 2>/dev/null |
+              tail -1
+          )
+
+          NOOM=$(
+            printf '%s' "$LAST" |
+              sed -nE \
+                's#.*oom/timeout/crash: ([0-9]+)/[0-9]+/[0-9]+.*#\1#p'
+          )
+          NOOM=${NOOM:-0}
+
+          NTIMEOUT=$(
+            printf '%s' "$LAST" |
+              sed -nE \
+                's#.*oom/timeout/crash: [0-9]+/([0-9]+)/[0-9]+.*#\1#p'
+          )
+          NTIMEOUT=${NTIMEOUT:-0}
+
+          NCRASH=$(
+            printf '%s' "$LAST" |
+              sed -nE \
+                's#.*oom/timeout/crash: [0-9]+/[0-9]+/([0-9]+).*#\1#p'
+          )
+          NCRASH=${NCRASH:-0}
+
+          shopt -s nullglob
+
+          CRASH_FILES=(hit_crash-*)
+          TIMEOUT_FILES=(hit_timeout-*)
+          OOM_FILES=(hit_oom-*)
+          SLOW_FILES=(hit_slow-unit-*)
+
+          NCRASH_FILES=${#CRASH_FILES[@]}
+          NTIMEOUT_FILES=${#TIMEOUT_FILES[@]}
+          NOOM_FILES=${#OOM_FILES[@]}
+          NSLOW_FILES=${#SLOW_FILES[@]}
+
+          CAPTURE=0
+          REASONS=()
+
+          if [ "$NEW" = "1" ]; then
+            CAPTURE=1
+            REASONS+=(high_value)
+          fi
+
+          if [ "$NCRASH" -gt 0 ]; then
+            CAPTURE=1
+            REASONS+=(log_crash)
+          fi
+
+          if [ "$NTIMEOUT" -gt 0 ]; then
+            CAPTURE=1
+            REASONS+=(log_timeout)
+          fi
+
+          if [ "$NOOM" -gt 0 ]; then
+            CAPTURE=1
+            REASONS+=(log_oom)
+          fi
+
+          if [ "$NCRASH_FILES" -gt 0 ]; then
+            CAPTURE=1
+            REASONS+=(physical_crash)
+          fi
+
+          if [ "$NTIMEOUT_FILES" -gt 0 ]; then
+            CAPTURE=1
+            REASONS+=(physical_timeout)
+          fi
+
+          if [ "$NOOM_FILES" -gt 0 ]; then
+            CAPTURE=1
+            REASONS+=(physical_oom)
+          fi
+
+          if [ "${#REASONS[@]}" -eq 0 ]; then
+            REASON="none"
+          else
+            REASON=$(
+              IFS=,
+              printf '%s' "${REASONS[*]}"
+            )
+          fi
+
+          {
+            echo "new=$NEW"
+            echo "capture=$CAPTURE"
+            echo "capture_reason=$REASON"
+
+            echo "ncrash=$NCRASH"
+            echo "ntimeout=$NTIMEOUT"
+            echo "noom=$NOOM"
+
+            echo "ncrash_files=$NCRASH_FILES"
+            echo "ntimeout_files=$NTIMEOUT_FILES"
+            echo "noom_files=$NOOM_FILES"
+            echo "nslow_files=$NSLOW_FILES"
+          } >> "$GITHUB_OUTPUT"
+
+          echo \
+            "INCIDENT_COUNTS crashes=$NCRASH/$NCRASH_FILES timeouts=$NTIMEOUT/$NTIMEOUT_FILES oom=$NOOM/$NOOM_FILES capture=$CAPTURE reason=$REASON"
+
+      - name: Construir y cifrar capsula del incidente
+        id: encrypt_incident
+        if: always() && steps.classify.outputs.capture == '1'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+
+          cd fuzz
+          shopt -s nullglob
+
+          if [ -z "${GPG_PUBLIC_KEY:-}" ]; then
+            echo "::error::Incidente detectado sin GPG_PUBLIC_KEY."
+            exit 20
+          fi
+
+          test -f fuzz.log || : > fuzz.log
+
+          GH="$(mktemp -d)"
+          PUB="$(mktemp)"
+
+          cleanup() {
+            rm -rf "$GH" "$PUB" incident.tgz pub.asc
+          }
+          trap cleanup EXIT
+
+          chmod 700 "$GH"
+          printf '%s' "$GPG_PUBLIC_KEY" > "$PUB"
+
+          GNUPGHOME="$GH" \
+            gpg --batch --import "$PUB" >/dev/null 2>&1
+
+          FPR=$(
+            GNUPGHOME="$GH" \
+              gpg --batch --with-colons --list-keys |
+              awk -F: '$1=="fpr"{print $10; exit}'
+          )
+
+          test -n "$FPR"
+
+          ENC="incident_${{ matrix.harness.bin }}_s${{ matrix.shard }}_${{ github.run_id }}_${{ github.run_attempt }}.tgz.gpg"
+
+          {
+            echo "schema_version=1"
+            echo "run_id=${{ github.run_id }}"
+            echo "run_attempt=${{ github.run_attempt }}"
+            echo "commit=${{ github.sha }}"
+            echo "harness=${{ matrix.harness.bin }}"
+            echo "shard=${{ matrix.shard }}"
+            echo "seed=${{ matrix.shard }}"
+            echo "fecha_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+            echo "capture_reason=${{ steps.classify.outputs.capture_reason }}"
+            echo "alto_valor=${{ steps.classify.outputs.new }}"
+
+            echo "log_crashes=${{ steps.classify.outputs.ncrash }}"
+            echo "log_timeouts=${{ steps.classify.outputs.ntimeout }}"
+            echo "log_oom=${{ steps.classify.outputs.noom }}"
+
+            echo "physical_crashes=${{ steps.classify.outputs.ncrash_files }}"
+            echo "physical_timeouts=${{ steps.classify.outputs.ntimeout_files }}"
+            echo "physical_oom=${{ steps.classify.outputs.noom_files }}"
+
+            echo "clang=$(clang-20 --version | head -1)"
+            echo "openssl=$(openssl version)"
+            echo "asan_options=${ASAN_OPTIONS:-}"
+            echo "ubsan_options=${UBSAN_OPTIONS:-}"
+          } > incident_manifest.txt
+
+          : > incident_hashes.txt
+
+          BUNDLE=(
+            fuzz.log
+            incident_manifest.txt
+            incident_hashes.txt
+          )
+
+          CRASH_FILES=(hit_crash-*)
+          OOM_FILES=(hit_oom-*)
+          TIMEOUT_FILES=(hit_timeout-*)
+
+          for f in "${CRASH_FILES[@]}"; do
+            BUNDLE+=("$f")
+            printf 'crash %s %s\n' \
+              "$(sha256sum "$f" | awk '{print $1}')" \
+              "$f" >> incident_hashes.txt
+          done
+
+          for f in "${OOM_FILES[@]}"; do
+            BUNDLE+=("$f")
+            printf 'oom %s %s\n' \
+              "$(sha256sum "$f" | awk '{print $1}')" \
+              "$f" >> incident_hashes.txt
+          done
+
+          if [ "${#TIMEOUT_FILES[@]}" -gt 0 ]; then
+            for f in "${TIMEOUT_FILES[@]}"; do
+              BUNDLE+=("$f")
+              printf 'timeout %s %s\n' \
+                "$(sha256sum "$f" | awk '{print $1}')" \
+                "$f" >> incident_hashes.txt
+            done
+
+          elif [ "${{ steps.classify.outputs.ntimeout }}" != "0" ]; then
+            SLOW_FILES=(hit_slow-unit-*)
+
+            for f in "${SLOW_FILES[@]}"; do
+              BUNDLE+=("$f")
+              printf 'slow-unit-as-timeout %s %s\n' \
+                "$(sha256sum "$f" | awk '{print $1}')" \
+                "$f" >> incident_hashes.txt
+            done
+          fi
+
+          tar -czf incident.tgz "${BUNDLE[@]}"
+
+          GNUPGHOME="$GH" \
+            gpg --batch --yes \
+              --trust-model always \
+              --recipient "$FPR" \
+              --output "$ENC" \
+              --encrypt incident.tgz
+
+          test -s "$ENC"
+
+          sha256sum "$ENC" > "$ENC.sha256"
+
+
+          {
+            echo "ok=true"
+            echo "file=$ENC"
+            echo "sha256=$(sha256sum "$ENC" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "ENCRYPTION=PASS file=$ENC"
+
+      - name: Subir capsula cifrada
+        id: upload_incident
+        if: always() && steps.encrypt_incident.outputs.ok == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: INCIDENT-ENCRYPTED-${{ matrix.harness.bin }}-s${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            fuzz/${{ steps.encrypt_incident.outputs.file }}
+            fuzz/${{ steps.encrypt_incident.outputs.file }}.sha256
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Fallback cifrado al pool si falla artifact
+        id: encrypted_pool
+        if: always() && steps.encrypt_incident.outputs.ok == 'true' && steps.upload_incident.outcome != 'success'
+        continue-on-error: true
+        run: |
+          set +e
+
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+
+          SRC="${{ github.workspace }}/fuzz/${{ steps.encrypt_incident.outputs.file }}"
+          SHAFILE="$SRC.sha256"
+
+          test -s "$SRC" || exit 1
+          test -s "$SHAFILE" || exit 1
+
+          for attempt in 1 2 3 4 5 6; do
+            rm -rf /tmp/poolv
+
+            git clone \
+              --depth 1 \
+              --branch corpus-pool \
+              --single-branch \
+              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              /tmp/poolv 2>/dev/null || {
+                sleep $((RANDOM % 7 + 2))
+                continue
+              }
+
+            REL="encrypted-incidents/${{ github.run_id }}/${{ matrix.harness.bin }}-s${{ matrix.shard }}"
+            DEST="/tmp/poolv/$REL"
+
+            mkdir -p "$DEST"
+
+            cp -- "$SRC" "$DEST/"
+            cp -- "$SHAFILE" "$DEST/"
+
+            cd /tmp/poolv
+
+            git config user.email "bot@fuzz"
+            git config user.name "encrypted-retention"
+
+            git add -- "$REL"
+
+            if git diff --cached --quiet; then
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              echo "FALLBACK_ALREADY_PRESENT=YES"
+              exit 0
+            fi
+
+            git commit -q \
+              -m "encrypted incident ${{ github.run_id }} ${{ matrix.harness.bin }} s${{ matrix.shard }}"
+
+            if git push origin corpus-pool 2>/dev/null; then
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              echo "FALLBACK_ENCRYPTED_POOL=PASS"
+              exit 0
+            fi
+
+            cd "$GITHUB_WORKSPACE"
+            sleep $((RANDOM % 7 + 2))
+          done
+
+          echo "FALLBACK_ENCRYPTED_POOL=FAIL"
+          exit 1
+
+      - name: Verificar retencion durable
+        id: retention
+        if: always() && steps.classify.outputs.capture == '1'
+        run: |
+          ENC="${{ steps.encrypt_incident.outputs.ok }}"
+          UPLOAD="${{ steps.upload_incident.outcome }}"
+          FALLBACK="${{ steps.encrypted_pool.outputs.ok }}"
+
+          echo "encrypt=$ENC"
+          echo "upload=$UPLOAD"
+          echo "fallback=$FALLBACK"
+
+          if [ "$ENC" != "true" ]; then
+            echo "status=encryption_failed" >> "$GITHUB_OUTPUT"
+            echo "::error::Incidente detectado, pero el cifrado fallo."
+            exit 1
+          fi
+
+          if [ "$UPLOAD" = "success" ]; then
+            echo "status=artifact_secured" >> "$GITHUB_OUTPUT"
+            echo "RETENTION=PASS destination=artifact"
+            exit 0
+          fi
+
+          if [ "$FALLBACK" = "true" ]; then
+            echo "status=fallback_secured" >> "$GITHUB_OUTPUT"
+            echo "::warning::Artifact fallo; ciphertext preservado en fallback."
+            echo "RETENTION=DEGRADED destination=encrypted_pool"
+            exit 1
+          fi
+
+          echo "status=retention_failed" >> "$GITHUB_OUTPUT"
+          echo "::error::Incidente detectado sin ninguna copia durable."
+          exit 1
+
+      - name: Crear metadata publica segura
+        if: always() && steps.classify.outputs.capture == '1'
+        run: |
+          set +e
+          cd fuzz
+
+          FAMILY=$(
+            grep -aoE \
+              'heap-use-after-free|use-after-free|heap-buffer-overflow|stack-buffer-overflow|global-buffer-overflow|double-free|stack-overflow|SEGV|out-of-bounds|ABRT|DEADLYSIGNAL' \
+              fuzz.log 2>/dev/null |
+              head -1
+          )
+
+          case "$FAMILY" in
+            *use-after-free)
+              FAMILY="UAF"
+              ;;
+            *buffer-overflow|out-of-bounds)
+              FAMILY="BUFFER_OVERFLOW"
+              ;;
+            double-free)
+              FAMILY="DOUBLE_FREE"
+              ;;
+            stack-overflow)
+              FAMILY="STACK_OVERFLOW"
+              ;;
+            SEGV)
+              FAMILY="SEGV"
+              ;;
+            ABRT|DEADLYSIGNAL)
+              FAMILY="ABRT"
+              ;;
+            *)
+              FAMILY="UNKNOWN"
+              ;;
+          esac
+
           {
             echo "harness=${{ matrix.harness.bin }}"
             echo "shard=${{ matrix.shard }}"
             echo "run=${{ github.run_id }}"
-            echo "fecha_utc=$STAMP"
-            echo "crashes=${{ steps.classify.outputs.ncrash }}"
-            echo "timeouts=${{ steps.classify.outputs.ntimeout }}"
-            echo "alto_valor=${{ steps.classify.outputs.new }}"
-            echo "--- tipo de error (sin input crudo) ---"
-            grep -aE 'ERROR: (AddressSanitizer|libFuzzer)|SUMMARY:|CRITICAL \[|Assertion failed|runtime error' fuzz.log 2>/dev/null \
-              | sed -E 's/0x[0-9a-f]+/0xN/g; s/[0-9]{5,}/N/g' | sort -u | head -12
-            echo "--- sha256 de los inputs (para deduplicar; el input NO se sube) ---"
-            for f in hit_*; do [ -e "$f" ] && sha256sum "$f" 2>/dev/null | awk '{print $1}'; done | head -20
-          } > "/tmp/$SIG"
-          for intento in 1 2 3 4 5; do
-            rm -rf /tmp/poolh
-            git clone --depth 1 --branch corpus-pool --single-branch \
-              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" /tmp/poolh 2>/dev/null || break
-            mkdir -p /tmp/poolh/hallazgos
-            cp -f "/tmp/$SIG" /tmp/poolh/hallazgos/
-            cd /tmp/poolh
-            git config user.email "bot@fuzz"; git config user.name "nube-${{ matrix.harness.bin }}"
-            git add -A
-            if git diff --cached --quiet; then cd "$GITHUB_WORKSPACE/fuzz"; break; fi
-            git commit -q -m "nube: hallazgo en ${{ matrix.harness.bin }} s${{ matrix.shard }} (crashes=${{ steps.classify.outputs.ncrash }})"
-            if git push origin corpus-pool 2>/dev/null; then echo "firma publicada: $SIG"; cd "$GITHUB_WORKSPACE/fuzz"; break; fi
-            cd "$GITHUB_WORKSPACE/fuzz"; sleep $((RANDOM % 7 + 2))
-          done
-          true
+            echo "fecha_utc=$(date -u +%Y%m%dT%H%M%SZ)"
 
-      # RUTA B (independiente de git): el mismo resumen como ARTEFACTO de GitHub.
-      # Si el push a corpus-pool falla (colision, token vencido, rama protegida),
-      # esta ruta sigue funcionando: el artefacto vive 30 dias y el colector local
-      # lo ve por la API. Solo metadata, nunca el input crudo (repo publico).
-      - name: "RUTA B: resumen como artefacto"
-        if: always() && steps.fuzz.outputs.rc != '200' && (steps.classify.outputs.ncrash != '0' || steps.classify.outputs.ntimeout != '0')
-        run: |
-          cd fuzz
-          {
-            echo "harness=${{ matrix.harness.bin }}"
-            echo "shard=${{ matrix.shard }}"
             echo "crashes=${{ steps.classify.outputs.ncrash }}"
             echo "timeouts=${{ steps.classify.outputs.ntimeout }}"
+            echo "oom=${{ steps.classify.outputs.noom }}"
+
+            echo "crash_files=${{ steps.classify.outputs.ncrash_files }}"
+            echo "timeout_files=${{ steps.classify.outputs.ntimeout_files }}"
+            echo "oom_files=${{ steps.classify.outputs.noom_files }}"
+
             echo "alto_valor=${{ steps.classify.outputs.new }}"
-            grep -aE 'ERROR: (AddressSanitizer|libFuzzer)|SUMMARY:|CRITICAL \[|Assertion failed' fuzz.log 2>/dev/null \
-              | sed -E 's/0x[0-9a-f]+/0xN/g; s/[0-9]{5,}/N/g' | sort -u | head -10
+            echo "capture_reason=${{ steps.classify.outputs.capture_reason }}"
+            echo "error_family=$FAMILY"
+            echo "retention=${{ steps.retention.outputs.status }}"
           } > resumen_hallazgo.txt
+
           cat resumen_hallazgo.txt
 
-      - name: "RUTA B: subir resumen"
-        if: always() && steps.fuzz.outputs.rc != '200' && (steps.classify.outputs.ncrash != '0' || steps.classify.outputs.ntimeout != '0')
+          STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+          SIG="hallazgo_${{ matrix.harness.bin }}_s${{ matrix.shard }}_${STAMP}.txt"
+
+          for attempt in 1 2 3 4 5; do
+            rm -rf /tmp/poolh
+
+            git clone \
+              --depth 1 \
+              --branch corpus-pool \
+              --single-branch \
+              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              /tmp/poolh 2>/dev/null || break
+
+            mkdir -p /tmp/poolh/hallazgos
+            cp resumen_hallazgo.txt "/tmp/poolh/hallazgos/$SIG"
+
+            cd /tmp/poolh
+
+            git config user.email "bot@fuzz"
+            git config user.name "safe-metadata"
+
+            git add -- "hallazgos/$SIG"
+
+            if git diff --cached --quiet; then
+              exit 0
+            fi
+
+            git commit -q \
+              -m "safe incident metadata ${{ github.run_id }}"
+
+            if git push origin corpus-pool 2>/dev/null; then
+              exit 0
+            fi
+
+            cd "$GITHUB_WORKSPACE/fuzz"
+            sleep $((RANDOM % 7 + 2))
+          done
+
+          true
+
+      - name: Subir metadata segura
+        if: always() && steps.classify.outputs.capture == '1'
         uses: actions/upload-artifact@v4
         with:
-          name: HALLAZGO-${{ matrix.harness.bin }}-s${{ matrix.shard }}-${{ github.run_id }}
+          name: HALLAZGO-${{ matrix.harness.bin }}-s${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: fuzz/resumen_hallazgo.txt
-          retention-days: 30
-
-      - name: Cifrar hit (solo si hay secret GPG)
-        if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY != ''
-        run: |
-          cd fuzz
-          echo "$GPG_PUBLIC_KEY" > pub.asc
-          gpg --import pub.asc
-          KEYID=$(gpg --list-keys --with-colons | awk -F: '/^pub/{print $5; exit}')
-          tar czf hit.tgz fuzz.log hit_* 2>/dev/null || tar czf hit.tgz fuzz.log
-          gpg --trust-model always --yes -e -r "$KEYID" hit.tgz
-          rm -f hit.tgz fuzz.log hit_* pub.asc
-
-      - name: Subir hit CIFRADO
-        if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: HIT-${{ matrix.harness.bin }}-s${{ matrix.shard }}
-          path: fuzz/hit.tgz.gpg
-          retention-days: 30
-
-      - name: "Subir SOLO firma (sin GPG: no filtrar crash a repo publico)"
-        if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY == ''
-        run: |
-          cd fuzz
-          { echo "HIT ALTO VALOR en ${{ matrix.harness.bin }} shard ${{ matrix.shard }}"; grep -aE 'CRITICAL \[|SUMMARY:' fuzz.log | grep -av 'is_in_range' | head -20; echo "(sin GPG: crash crudo NO subido. Setea el secret GPG_PUBLIC_KEY para captura cifrada.)"; } > hit_signature.txt
-
-      - name: Subir firma
-        if: steps.classify.outputs.new == '1' && env.GPG_PUBLIC_KEY == ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: HIT-SIGNATURE-${{ matrix.harness.bin }}-s${{ matrix.shard }}
-          path: fuzz/hit_signature.txt
-          retention-days: 30
+          retention-days: 90
 
       - name: Marcar fallo si HIT (dispara email a tu Gmail)
         if: steps.classify.outputs.new == '1'
