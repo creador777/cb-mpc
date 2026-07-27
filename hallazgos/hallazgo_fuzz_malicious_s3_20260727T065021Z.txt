@@ -1,0 +1,14 @@
+harness=fuzz_malicious
+shard=3
+run=30232972306
+fecha_utc=20260727T065021Z
+crashes=1
+timeouts=0
+oom=0
+crash_files=1
+timeout_files=0
+oom_files=0
+alto_valor=0
+capture_reason=log_crash,physical_crash
+error_family=ABRT
+retention=artifact_secured
