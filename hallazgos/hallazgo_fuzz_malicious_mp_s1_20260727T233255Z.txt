@@ -1,0 +1,14 @@
+harness=fuzz_malicious_mp
+shard=1
+run=30298147648
+fecha_utc=20260727T233255Z
+crashes=0
+timeouts=0
+oom=0
+crash_files=1
+timeout_files=4
+oom_files=0
+alto_valor=0
+capture_reason=physical_crash,physical_timeout
+error_family=UNKNOWN
+retention=artifact_secured
