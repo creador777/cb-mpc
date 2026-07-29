@@ -145,7 +145,21 @@ struct network_t {
   }
 };
 
-static constexpr auto kRecvTimeout = std::chrono::seconds(30);
+// ---------------------------------------------------------------------------
+// INVARIANTE (2026-07-29): este backstop DEBE ser menor que el -timeout de
+// libFuzzer, que swarm_local.sh y fuzz-farm.yml fijan en 25s.
+//
+// Estaba en 30s, o sea MAYOR. Consecuencia: el backstop no podia dispararse
+// nunca. Ante un receive estancado libFuzzer llegaba primero, declaraba
+// TIMEOUT y mataba el proceso, en vez de que la operacion devolviera un error
+// limpio y el fuzzing siguiera. Se perdia la ejecucion entera, se escribia un
+// artefacto y habia que reiniciar. fuzz_malicious_party.cpp y
+// fuzz_schnorr_party.cpp ya respetaban la regla con 8s; este archivo no.
+//
+// Se alinea con esos dos. Si algun dia se sube el -timeout de libFuzzer, hay
+// que subir este valor DESPUES y siempre por debajo.
+// ---------------------------------------------------------------------------
+static constexpr auto kRecvTimeout = std::chrono::seconds(8);
 
 // ============================================================================
 // Transporte honesto (para bootstrap DKG)

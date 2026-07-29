@@ -114,3 +114,37 @@ fuzz/corpus_mut/
 fuzz/corpus_d2/
 fuzz/corpus_diag/
 fuzz/.cuarentena_*
+
+/fuzz/claves_backup/
+
+# ============================================================================
+# RAIZ DEL REPO — HUECO REAL, no teorico (verificado 2026-07-29)
+#
+# Todas las reglas de arriba estan ancladas a "fuzz/". Pero varios artefactos
+# aparecen en la RAIZ del repositorio, donde NINGUNA regla los cubria. Estado
+# encontrado ese dia en este repo, que es PUBLICO:
+#
+#     ?? cbmpc_key1.bin      1112 bytes   <- material de clave, sin ignorar
+#     ?? cbmpc_key2.bin       852 bytes   <- idem
+#     ?? slow-unit-04d8c89b...             <- artefacto de fuzzing, sin ignorar
+#
+# "fuzz/*.bin" no matchea "/cbmpc_key1.bin". Estaban a un "git add -A" de
+# quedar publicados. Se ancla con "/" para que aplique SOLO a la raiz y no
+# tape nada dentro de subdirectorios legitimos. Verificado antes de escribir
+# esto: no hay ningun *.bin rastreado en el repo.
+# ============================================================================
+/*.bin
+/cbmpc_key*.bin
+/slow-unit-*
+/crash-*
+/hit_*
+/sl_*
+/uaf_*
+/diag_*
+/timeout-*
+/oom-*
+/leak-*
+
+# Respaldos y locks que genera el utillaje local
+*.bak-*
+fuzz/.swarm_local.tick.lock

@@ -500,10 +500,32 @@ jobs:
         id: encrypted_pool
         if: always() && steps.encrypt_incident.outputs.ok == 'true' && steps.upload_incident.outcome != 'success'
         continue-on-error: true
+        env:
+          CORPUS_POOL_TOKEN: ${{ secrets.CORPUS_POOL_TOKEN }}
         run: |
           set +e
 
           echo "ok=false" >> "$GITHUB_OUTPUT"
+
+          # --------------------------------------------------------------
+          # 2026-07-29 — ULTIMA RUTA DE ESCRITURA AL REPO PUBLICO, CERRADA.
+          #
+          # Este fallback publicaba el bundle GPG del incidente en la rama
+          # corpus-pool del repo PUBLICO. Iba cifrado, y nunca llego a
+          # dispararse (no hay un solo encrypted-incidents/ en la rama), pero
+          # dejaba abierta la ultima puerta por la que un artefacto de crash
+          # podia terminar en publico.
+          #
+          # Ahora va al repo privado. Si falta CORPUS_POOL_TOKEN no se publica
+          # y NO se inventa un destino: el paso "Verificar retencion durable"
+          # de mas abajo convierte en error la ausencia de copia durable, asi
+          # que la perdida es RUIDOSA, nunca silenciosa. Preferimos un run en
+          # rojo antes que un PoC en un repo publico.
+          # --------------------------------------------------------------
+          if [ -z "${CORPUS_POOL_TOKEN:-}" ]; then
+            echo "::warning::CORPUS_POOL_TOKEN ausente; sin fallback cifrado (no existe destino publico)."
+            exit 1
+          fi
 
           SRC="${{ github.workspace }}/fuzz/${{ steps.encrypt_incident.outputs.file }}"
           SHAFILE="$SRC.sha256"
@@ -518,7 +540,7 @@ jobs:
               --depth 1 \
               --branch corpus-pool \
               --single-branch \
-              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              "https://x-access-token:${CORPUS_POOL_TOKEN}@github.com/creador777/cbmpc-corpus.git" \
               /tmp/poolv 2>/dev/null || {
                 sleep $((RANDOM % 7 + 2))
                 continue
