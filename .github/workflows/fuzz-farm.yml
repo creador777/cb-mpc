@@ -596,8 +596,10 @@ jobs:
           echo "::error::Incidente detectado sin ninguna copia durable."
           exit 1
 
-      - name: Crear metadata publica segura
+      - name: Crear metadata segura del incidente
         if: always() && steps.classify.outputs.capture == '1'
+        env:
+          CORPUS_POOL_TOKEN: ${{ secrets.CORPUS_POOL_TOKEN }}
         run: |
           set +e
           cd fuzz
@@ -655,6 +657,24 @@ jobs:
 
           cat resumen_hallazgo.txt
 
+          # --------------------------------------------------------------
+          # 2026-07-29 — LOS HALLAZGOS YA NO VAN A LA RAMA PUBLICA.
+          #
+          # Son contadores (que harness rompe, con que familia de error, en que
+          # run). No llevan input crudo ni stack trace, pero publicados le dan
+          # a un competidor el mapa de donde estamos encontrando cosas antes de
+          # que reportemos. Los 35 historicos se movieron a un repo PRIVADO.
+          #
+          # FAIL-OPEN A PROPOSITO: si falta CORPUS_POOL_TOKEN no se publica y
+          # NO se rompe el run. La caza no puede depender de un token que
+          # expira. El artifact de abajo (90 dias) es el canal de respaldo y
+          # el panel ya lo lee. Lo unico prohibido es volver al publico.
+          # --------------------------------------------------------------
+          if [ -z "${CORPUS_POOL_TOKEN:-}" ]; then
+            echo "::notice::CORPUS_POOL_TOKEN ausente; hallazgo solo va por artifact."
+            exit 0
+          fi
+
           STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
           SIG="hallazgo_${{ matrix.harness.bin }}_s${{ matrix.shard }}_${STAMP}.txt"
 
@@ -665,7 +685,7 @@ jobs:
               --depth 1 \
               --branch corpus-pool \
               --single-branch \
-              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              "https://x-access-token:${CORPUS_POOL_TOKEN}@github.com/creador777/cbmpc-corpus.git" \
               /tmp/poolh 2>/dev/null || break
 
             mkdir -p /tmp/poolh/hallazgos
@@ -686,6 +706,7 @@ jobs:
               -m "safe incident metadata ${{ github.run_id }}"
 
             if git push origin corpus-pool 2>/dev/null; then
+              echo "hallazgo publicado al archivo privado"
               exit 0
             fi
 
@@ -693,6 +714,7 @@ jobs:
             sleep $((RANDOM % 7 + 2))
           done
 
+          echo "::warning::No se pudo publicar al archivo privado; queda el artifact."
           true
 
       - name: Subir metadata segura
